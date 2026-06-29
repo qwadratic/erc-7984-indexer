@@ -44,3 +44,30 @@ these are explicitly *not* in scope, captured so the trade-offs stay visible.
 - Recipients of test transfers are **unfunded accounts** (not delegating), so each amount
   handle is decryptable only via the sender — keeps the measurement clear of shared-handle
   counterparty interplay (the code is intentionally not aware of that distinction).
+
+## Backlog — finalize local test plumbing (P3 prereq)
+- **Real FHE inputs in `tests/runner.ts`** — Phase-1 `confidentialTransfer` currently passes a
+  zero handle + empty proof placeholder; it cannot actually transfer. Generate real inputs via
+  the Zama SDK (`createEncryptedInput(token,user).add64(amount).encrypt()` → `{handles,inputProof}`)
+  so transfers execute and produce decryptable amount handles. **Blocks any spike run.**
+- **Budget-gated preflight** — given live `cast gas-price` + measured per-op gas (see
+  recordings/runbook.md), compute max-affordable `SPIKE_N` and ABORT if the config would exceed
+  the remaining ETH budget. Prevents running dry mid-test.
+- **anvil-fork harness** — fork at latest block for free/iterative gas measurement (validate that
+  `FHE.fromExternal` input verification passes on a fork before relying on it for CT gas).
+- **Runbook** — keep recording useful procedures as found (recordings/runbook.md).
+
+## Future build — decrypt scheduler (validated by SDK grind)
+The SDK (3.3.0-alpha.3) does **no implicit decrypt batching/queueing** — each
+`decrypt*Values` call is an independent relayer round-trip (~2.5s warm / ~6s cold; measured).
+WIP branches (`feat/batcher-utility`, credential-batching) batch *permits*, not decrypts;
+`feat/sdk-236-relayer-back-pressure` only exposes 429 `retryAfterMs`. So the optimization is
+ours to design — the "future build" the brief invites:
+- **DecryptScheduler**: one queue per delegator/credential; flush on **batch-full (≤28)** OR a
+  **configurable SLA deadline** (max wait before a lone request is sent); dedupe shared
+  counterparty handles; bound in-flight per delegator via `maxConcurrency`. Amortizes the ~2.5s
+  round-trip across up to 28 handles → ~11 handles/sec/delegator serial, ×concurrency parallel.
+  Sketch in `recordings/sdk-batching-report.md` (c).
+- When `sdk-236` ships, honor `RelayerRequestFailedError.retryAfterMs` (back-pressure).
+- SDK gap: gateway handle-limit isn't exposed/auto-chunked — our `HANDLES_PER_REQUEST=28` is
+  empirical; would break if the gateway limit changes.

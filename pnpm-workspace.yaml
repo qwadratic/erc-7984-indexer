@@ -1,3 +1,5 @@
 allowBuilds:
   esbuild: true
   keccak: true
+minimumReleaseAgeExclude:
+  - '@zama-fhe/sdk@3.3.0-alpha.3'

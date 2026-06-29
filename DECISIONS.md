@@ -14,11 +14,11 @@ We don't build auth or product logic. The boundary is deliberate: given capped r
 
 ### Decryption decoupled from indexing — for product reasons, not just SSR
 
-The Vite-SSR / `import.meta.resolve` incompatibility forced a separate process (`scripts/decrypt-worker.ts` runs as standalone `tsx`, outside Ponder's Vite context), but that's the small reason. The real one: all future value is in the decryption *scheduling* strategy — an almost-entirely offchain problem the indexing framework can't help with, except via cross-schema queries, which Ponder gives us. So indexer code never calls the SDK directly; it produces reorg-stable onchain tables (`token_event`, `balances`, `delegation_event`) that the offchain grinder reads to schedule and execute cleartext backfill. Indexing and decryption evolve independently.
+A technical blocker originally forced a separate process — the SDK's `node()` transport used `import.meta.resolve`, which Ponder's Vite SSR rewrote to a non-existent symbol. As of `@zama-fhe/sdk` 3.3.0-alpha.2 (SDK-235 / #490) that blocker is **gone** (it now resolves via `createRequire(import.meta.url)`), so the separation is no longer technically required — fine, because that was always the *small* reason. The real one: all future value is in the decryption *scheduling* strategy — an almost-entirely offchain problem the indexing framework can't help with, except via cross-schema queries, which Ponder gives us. So indexer code never calls the SDK directly; it produces reorg-stable onchain tables (`token_event`, `balances`, `delegation_event`) that the offchain grinder reads to schedule and execute cleartext backfill. Indexing and decryption evolve independently.
 
 ### Foundational, non-opinionated scheduling
 
-A working hypothesis, **not** baked into code: one decrypt primitive (batch or non-batch) for everything; never decrypt outdated balance handles — only HEAD; prioritize tail (latest) txs over historical, but still run historical backfill at a measurable, predictable completion rate we hold direct levers on. That rate is a *product lever* that changes with what users need from the API. The code keeps the strategy pivotable — the worker's per-delegator loop (balance gate → batch transfers, newest-first) is the current instantiation, not a hard-coded policy.
+A working hypothesis, **not** baked into code: one decrypt primitive (batch or non-batch) for everything; never decrypt outdated balance handles — only HEAD; prioritize tail (latest) txs over historical, but still run historical backfill at a measurable, predictable completion rate we hold direct levers on. That rate is a *product lever* that changes with what users need from the API. The code keeps the strategy pivotable — the worker's per-delegator loop (balance gate → batch transfers, newest-first) is the current instantiation, not a hard-coded policy. The designed (not built) next step — since the SDK does **no** implicit cross-call batching (verified) — is a **decrypt scheduler**: one queue per delegator, flushing on batch-full (2048-bit) **or** a configurable SLA deadline, coalescing across delegators and honoring relayer back-pressure. See `IDEAS.md`.
 
 ## Crucial decisions
 
@@ -54,7 +54,7 @@ Delegations can be granted **forever** (max-uint64 expiry, `18446744073709551615
 
 ### Single Postgres
 
-One Postgres instance hosts everything: Ponder's indexed tables in `public` and the decrypt worker's cleartext in `app.cleartext`. Two OS processes share the database — Ponder (event handlers + API) and the decrypt worker (SDK + Zama relay). The decrypt worker runs as a separate `tsx` process because the Zama SDK's `node()` transport uses `import.meta.resolve`, which Ponder's Vite SSR context transforms into a non-existent symbol. Separate processes, shared database.
+One Postgres instance hosts everything: Ponder's indexed tables in `public` and the decrypt worker's cleartext in `app.cleartext`. Two OS processes share the database — Ponder (event handlers + API) and the decrypt worker (SDK + Zama relay). The decrypt worker runs as a separate `tsx` process — a **product choice** (offchain decrypt scheduling, independent crash domain, polling loop). This was *also* once technically forced by the SDK's `node()` transport using `import.meta.resolve` (broken under Ponder's Vite SSR), but that blocker was fixed in `@zama-fhe/sdk` 3.3.0-alpha.2 (#490). Separate processes, shared database.
 
 ### Log-only handlers (zero RPC)
 
@@ -108,7 +108,7 @@ Before decrypting any handle, skip it if it already exists in `app.cleartext`. A
 
 Relay concurrency is bounded by `delegatedBatchDecryptValues`' own `maxConcurrency` (= `DECRYPT_RELAY_CONCURRENCY`, default 10) — no external `pLimit`. The balance gate uses `delegatedDecryptValues` (single handle); transfer amounts use the batch variant.
 
-`HANDLES_PER_REQUEST = 28` (gateway limit: 2048 bits; euint64 = 64 bits → max 32; use 28 for margin) — the batch method does not auto-chunk, so we chunk to stay under the gateway limit.
+`HANDLES_PER_REQUEST = 28` — the gateway caps a request at **2048 total encrypted bits** (proven: `Decryption.sol:151 MAX_DECRYPTION_REQUEST_BITS` in zama-ai/fhevm; mirrored client-side by relayer-sdk's `check2048EncryptedBits`). It's a *bit* budget, not a handle count: euint64 = 64 bits → 32 max; we use 28 (conservative, euint64-only). The batch method does not auto-chunk, so we chunk.
 
 ## Amount-handle ACL persistence — RESOLVED ✓
 
@@ -131,6 +131,8 @@ Secrets via `psst` CLI: `MNEMONIC` (shared anvil + seed), `SEPOLIA_RPC_URL` (Alc
 
 Premise: RPC with decent rate limits → fresh sync fast, resyncs cheap (Ponder cache + reindex strategies). ERC-20-style transfer-event indexing is the dominant, community-optimized path → assumed NOT the bottleneck. So the weakest link is decryption, deliberately made independent of indexing (it only needs handles + the identities they're bound to, treated as given). The spiking-throughput test (`tests/runner.ts`, scenario `spiking-throughput`) exists to prove exactly that boundary — what breaks first is relayer throughput / propagation under a simultaneous-delegation spike; the test measures handles/sec on the fresh per-run delta to prove it.
 
+**Measured so far (warm, n=12, cold start excluded):** the relayer round-trip is the fixed cost — ~2.4s/request whether it carries 1 or 3 handles — so batching amortizes (~2.9× at 3 handles; one request holds up to `HANDLES_PER_REQUEST=28`). The SDK does **no** implicit cross-call batching (verified in source), so that amortization is ours to drive. **Honest caveat:** every existing handle was decrypted before, so relayer-side caching can't be ruled out — true-cold latency, the batch-28 *saturation* curve, and concurrency scaling remain **hypotheses** pending a funded fresh-handle run.
+
 ### Time sink
 
 Most cognitive load went to finding the right way to attack the bottleneck: kept focus on decryption, stood up the detached `app.cleartext` schema early, then hunted (taste-guided) for the undocumented SDK methods that batch *pure* handle decryption — not envelopes like `confidentialBalanceOf` (great for a balance; no equivalent for handles embedded in events). The belief that a low-level batch decrypt exists (`delegatedBatchDecryptValues`) and can be scheduled cleverly was the journey; not certain the current solution is optimal. Also invested early in understanding propagation and pre-empting pitfalls before the first line of code.
@@ -141,5 +143,5 @@ I used AI on three fronts — (1) ramping fast on protocol architecture and the 
 
 ## SDK Feedback
 
-1. **Batch vs non-batch decrypt — error/partial-failure semantics are under-documented.** Both `delegatedDecryptValues` and `delegatedBatchDecryptValues` are easy to find, but the difference in failure handling isn't clear from docs; had to empirically research relayer-side batch limits to choose safely.
+1. **Could the request-size cap guide the caller?** From `Decryption.sol:151` (`MAX_DECRYPTION_REQUEST_BITS = 2048`) and the relayer-sdk's `check2048EncryptedBits`, an oversized batch throws *"Cannot decrypt more than 2048 encrypted bits"* — but the SDK doesn't expose that budget or the safe chunk size, so consumers hardcode it (our `HANDLES_PER_REQUEST = 28`), a coupling that breaks if the protocol changes the constant. Would exposing `maxDecryptionBits` as a queryable value — or an optional auto-chunking mode on `delegatedDecryptValues` — be better for server-side workloads? (Feedback section to be refined later from `IDEAS.md`.)
 2. **Propagation-readiness needs docs (not an API).** A universal `isPropagated()` can't exist — it needs an offchain source of truth, and the SDK correctly trusts onchain truth. That's the right call, but it should be surfaced/documented so integrators build a propagation gate instead of hitting `DelegationNotPropagatedError` blind.

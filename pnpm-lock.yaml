@@ -15,8 +15,8 @@ importers:
         specifier: 0.4.0
         version: 0.4.0(@fhevm/solidity@0.11.1)(@openzeppelin/contracts-upgradeable@5.6.1(@openzeppelin/contracts@5.6.1))(@openzeppelin/contracts@5.6.1)
       '@zama-fhe/sdk':
-        specifier: 3.2.0-alpha.2
-        version: 3.2.0-alpha.2(ethers@6.17.0)(viem@2.53.1(typescript@5.9.3)(zod@3.25.76))
+        specifier: 3.3.0-alpha.3
+        version: 3.3.0-alpha.3(ethers@6.17.0)(viem@2.53.1(typescript@5.9.3)(zod@3.25.76))
       hono:
         specifier: ^4.12.27
         version: 4.12.27
@@ -835,8 +835,8 @@ packages:
     engines: {node: '>=22'}
     hasBin: true
 
-  '@zama-fhe/sdk@3.2.0-alpha.2':
-    resolution: {integrity: sha512-/C9jyIpf74IW5i2Z/DkEFwUjU0HLKfsn95OBBatM9q3N61FJ1moLO1G4YPge9MuSKgy3XwIF35M6+b6H1kUl3g==}
+  '@zama-fhe/sdk@3.3.0-alpha.3':
+    resolution: {integrity: sha512-e3piCr3ZPseMR76J3cRmfgDGwhmTmQQ8kVBnLDDWIs5t3/NglEwh7zcVvVCHVzujT2rA1UOKynf8PR38IG8Q+Q==}
     engines: {node: '>=22'}
     peerDependencies:
       '@tanstack/query-core': '>=5'
@@ -2746,7 +2746,7 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@zama-fhe/sdk@3.2.0-alpha.2(ethers@6.17.0)(viem@2.53.1(typescript@5.9.3)(zod@3.25.76))':
+  '@zama-fhe/sdk@3.3.0-alpha.3(ethers@6.17.0)(viem@2.53.1(typescript@5.9.3)(zod@3.25.76))':
     dependencies:
       '@zama-fhe/relayer-sdk': 0.4.4
       zod: 4.4.3

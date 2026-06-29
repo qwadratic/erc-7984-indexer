@@ -2,10 +2,13 @@
  * Standalone decrypt worker — runs OUTSIDE Ponder's Vite SSR context.
  * Reads Ponder tables + writes app.cleartext in the SAME Postgres.
  *
- * The Zama SDK's node() transport uses import.meta.resolve to locate its WASM
- * worker file. Ponder uses Vite SSR which transforms import.meta.resolve into
- * __vite_ssr_import_meta__.resolve (which doesn't exist). Running as a standalone
- * tsx process avoids this incompatibility. This is the design, not a workaround.
+ * Originally this separation was ALSO forced by a technical blocker: the SDK's node()
+ * transport used import.meta.resolve to locate its WASM worker, which Ponder's Vite SSR
+ * rewrote to __vite_ssr_import_meta__.resolve (undefined at runtime). As of
+ * @zama-fhe/sdk 3.3.0-alpha.2 (SDK-235 / PR #490) that blocker is GONE — the node worker
+ * now resolves via createRequire(import.meta.url).resolve(). So the separate process is now
+ * a PRODUCT choice (offchain decrypt scheduling, independent crash domain, polling loop),
+ * not a technical workaround.
  *
  * Per readable delegator each tick:
  *   (1) refresh + decrypt the current balance handle at HEAD — also the propagation gate
@@ -109,6 +112,10 @@ const TOKEN = (process.env.TOKEN_ADDRESS ?? "").toLowerCase() as Address;
 const INDEXER_PK = process.env.INDEXER_PRIVATE_KEY as `0x${string}`;
 const RPC_URL = process.env.PONDER_RPC_URL_11155111!;
 const DATABASE_URL = process.env.DATABASE_URL!;
+// Gateway caps a decryption request at MAX_DECRYPTION_REQUEST_BITS = 2048 TOTAL encrypted
+// bits (proven: gateway-contracts/contracts/Decryption.sol:151 in zama-ai/fhevm; mirrored
+// client-side by @zama-fhe/relayer-sdk check2048EncryptedBits). It's a BIT budget, not a
+// handle count: euint64 = 64 bits → 2048/64 = 32 max; we use 28 (conservative, euint64-only).
 const HANDLES_PER_REQUEST = 28;
 
 // ── Postgres ──
