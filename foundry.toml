@@ -1,0 +1,28 @@
+[profile.default]
+src = "evm/src"
+out = "evm/out"
+test = "evm/test"
+script = "evm/script"
+libs = ["evm/lib/forge-fhevm/dependencies", "evm/lib"]
+solc = "0.8.27"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 100
+cbor_metadata = false
+bytecode_hash = "none"
+
+# Required: FhevmTest.setUp() writes canonical host addresses to disk
+fs_permissions = [
+    { access = "read-write", path = "evm/lib/forge-fhevm/src/fhevm-host/addresses/FHEVMHostAddresses.sol" },
+]
+
+[fuzz]
+runs = 256
+
+[fmt]
+line_length = 120
+
+[lint]
+ignore = ["evm/lib/**/*.sol"]
+exclude_lints = ["asm-keccak256", "mixed-case-function"]
+

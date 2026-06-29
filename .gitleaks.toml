@@ -1,0 +1,23 @@
+# gitleaks config for erc-7984-indexer
+# Entropy/regex secret scanning (complements psst's vault-value matching).
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Public Sepolia on-chain identifiers (contract addresses, FHE handles) — public data, not secrets"
+regexes = [
+  # Known public contract / identity addresses (case-insensitive)
+  '''(?i)0x46208622DA27d91db4f0393733C8BA082ed83158''', # cWETHMock (token)
+  '''(?i)0xff54739b16576FA5402F211D0b938469Ab9A5f3F''', # WETHMock (underlying)
+  '''(?i)0xf0Ffdc93b7E186bC2f8CB3dAA75D86d1930A433D''', # ACL proxy
+  '''(?i)0x2f0750Bbb0A246059d80e94c454586a7F27a128e''', # Wrappers Registry
+  '''(?i)0xF2988048C7FE127b0a11E5BCD27557fcb445B133''', # indexer identity (address only)
+  # FHE ciphertext handles: bytes32 ending in the Sepolia chain-id suffix (public pointers)
+  '''(?i)0x[0-9a-f]{52}aa36a7[0-9a-f]{4}''',
+]
+paths = [
+  # Asciinema recordings + redacted transcript + rendered demo are full of public on-chain hex
+  '''recordings/.*\.cast''',
+  '''docs/session-transcript\.jsonl''',
+  '''demo/erc7984-indexer-demo\.mp4''',
+]

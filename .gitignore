@@ -1,0 +1,45 @@
+# deps
+node_modules/
+
+# secrets
+.psst/
+.env
+.env.local
+
+# ponder / data
+.ponder/
+data/
+generated/
+
+# foundry
+evm/out/
+evm/cache/
+evm/broadcast/**/dry-run/
+
+# recordings — raw casts kept, scratch ignored
+recordings/*.tmp
+recordings/scratch/
+
+# pid lock
+.decrypt-worker.lock
+
+# misc
+*.log
+.DS_Store
+cache/
+
+# session exports are auto-regenerated UNREDACTED — never commit (contain secrets)
+.env.*.local
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# heavy/local artifacts — video on YouTube, instance live; not tracked
+demo/
+demos/
+docs/
+recordings/
+
+# planning doc — kept local, not in repo
+PLAN.md

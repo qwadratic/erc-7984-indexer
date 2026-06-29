@@ -1,0 +1,77 @@
+[
+  {
+    "name": "wrap-happy-path",
+    "description": "A public wrap (no FHE encryption needed) produces a ConfidentialTransfer log, a token_event row with cleartextAmount, and a decrypted API response.",
+    "given": {
+      "narrative": "account[0] holds WETHMock; cWETHMock is the indexed token.",
+      "actor": "0x3c3940d08a5fb1fb00c3115b5c287d76de7b583b",
+      "actorIndex": 0,
+      "token": "0x46208622DA27d91db4f0393733C8BA082ed83158",
+      "underlying": "0xff54739b16576FA5402F211D0b938469Ab9A5f3F"
+    },
+    "when": {
+      "narrative": "Approve and wrap 1e18 wei of WETHMock into cWETHMock (1 underlying token = 1,000,000 wrapper units).",
+      "steps": [
+        {
+          "action": "cast_send",
+          "to": "0xff54739b16576FA5402F211D0b938469Ab9A5f3F",
+          "sig": "approve(address,uint256)",
+          "args": ["0x46208622DA27d91db4f0393733C8BA082ed83158", "1000000000000000000"]
+        },
+        {
+          "action": "cast_send",
+          "to": "0x46208622DA27d91db4f0393733C8BA082ed83158",
+          "sig": "wrap(address,uint256)",
+          "args": ["0x3c3940d08a5fb1fb00c3115b5c287d76de7b583b", "1000000000000000000"],
+          "captureHash": true
+        }
+      ],
+      "amount": "1000000000000000000"
+    },
+    "then": {
+      "log": {
+        "narrative": "The wrap tx receipt contains a ConfidentialTransfer log from cWETHMock AND an underlying Transfer(account0 → cWETHMock, 12345) log.",
+        "expectTopic0_ConfidentialTransfer": "0x67500e8d0ed826d2194f514dd0d8124f35648ab6e3fb5e6ed867134cffe661e9",
+        "expectTopic0_Transfer": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+      },
+      "db": {
+        "narrative": "A token_event row with kind='wrap', toAddr=account[0], cleartextAmount=12345.",
+        "table": "public.token_event",
+        "matchOn": "tx_hash",
+        "expect": {
+          "kind": "wrap",
+          "to_addr": "0x3c3940d08a5fb1fb00c3115b5c287d76de7b583b",
+          "cleartext_amount": "1000000000000000000"
+        }
+      },
+      "api": {
+        "narrative": "/v1/accounts/<account0>/transfers includes the wrap with amount=12345, status=decrypted.",
+        "endpoint": "/v1/accounts/0x3c3940d08a5fb1fb00c3115b5c287d76de7b583b/transfers",
+        "expectItem": {
+          "kind": "wrap",
+          "amount": "1000000000000000000",
+          "status": "decrypted"
+        }
+      }
+    }
+  },
+  {
+    "name": "spiking-throughput",
+    "description": "Measures decryption throughput under a realistic load spike: N accounts each perform SPIKE_N confidential transfers (generating amount handles), then all simultaneously delegate to the indexer. The decrypt worker drains the handle backlog; throughput = handles/sec from first to last decryption.",
+    "given": {
+      "narrative": "SPIKE_ACCOUNTS mnemonic-derived accounts, each funded with ETH (gas) and WETHMock (underlying). INDEXER = mnemonic index 9.",
+      "indexerIndex": 9,
+      "indexerAddress": "0xF2988048C7FE127b0a11E5BCD27557fcb445B133",
+      "token": "0x46208622DA27d91db4f0393733C8BA082ed83158",
+      "underlying": "0xff54739b16576FA5402F211D0b938469Ab9A5f3F"
+    },
+    "when": {
+      "narrative": "Phase 1: each account wraps underlying into cWETH then sends SPIKE_N confidential transfers to acct[(i+1)%ACCOUNTS]. Phase 2: all accounts delegate to INDEXER near-simultaneously."
+    },
+    "then": {
+      "narrative": "Phase 3: poll app.cleartext until >=95% of expected handles are decrypted or timeout. Report throughput = handles / (t_last - t_first) in handles/sec.",
+      "passThreshold": 0.95,
+      "timeoutMs": 600000
+    }
+  }
+]

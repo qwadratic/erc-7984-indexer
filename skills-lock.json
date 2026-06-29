@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "skills": {
+    "foundry-solidity": {
+      "source": "tenequm/skills",
+      "sourceType": "github",
+      "skillPath": "skills/foundry-solidity/SKILL.md",
+      "computedHash": "852fd41402c682ec78a5f8f97bb07800dcdc2e1e86f41d06e4c0d3c930fd44d6"
+    },
+    "ponder": {
+      "source": "hefgi/skills",
+      "sourceType": "github",
+      "skillPath": "ponder/SKILL.md",
+      "computedHash": "a3d898339f6a19e4a13f6242ef156b7babbd5a2b2cfcaf9ec21f58d56ac000bf"
+    },
+    "typescript-expert": {
+      "source": "sickn33/antigravity-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/typescript-expert/SKILL.md",
+      "computedHash": "525e74a7220ed67832001ca89b46deae8f2bab1abc9d25c56c8716d6550c795f"
+    },
+    "zama-protocol": {
+      "source": "zama-ai/skills",
+      "sourceType": "github",
+      "skillPath": "skills/zama-protocol/SKILL.md",
+      "computedHash": "87e2af5d93d8e86d87384b7f9bdaa9e8ee867f745bdc33fc45277da7f00e6a72"
+    },
+    "zama-solidity": {
+      "source": "zama-ai/skills",
+      "sourceType": "github",
+      "skillPath": "skills/zama-solidity/SKILL.md",
+      "computedHash": "95add15eee3f4e0921406b3c0bb7d9d48cad8a8137c99fcee101e95062da70e1"
+    },
+    "zama-typescript": {
+      "source": "zama-ai/skills",
+      "sourceType": "github",
+      "skillPath": "skills/zama-typescript/SKILL.md",
+      "computedHash": "e89fc77d6e0c32de804bbcd5f62856400a30f91902e30b84b980caeefa94c3d1"
+    }
+  }
+}

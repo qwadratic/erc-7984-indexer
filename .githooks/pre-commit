@@ -1,0 +1,15 @@
+#!/bin/sh
+# Secure pre-commit: psst (known vault values, by name) + gitleaks (entropy/regex).
+# Layers are complementary: psst catches stored secrets even at low entropy (e.g. mnemonics);
+# gitleaks catches high-entropy/3rd-party secrets not in the vault (API keys, tokens).
+# Bypass (only for a confirmed false positive): PSST_SKIP_SCAN=1 git commit | git commit --no-verify
+[ "$PSST_SKIP_SCAN" = "1" ] && exit 0
+ROOT=$(git rev-parse --show-toplevel); fail=0
+if command -v psst >/dev/null 2>&1 && [ -d "$ROOT/.psst" ]; then
+  psst scan --staged --quiet || { echo "✗ psst: staged file contains a known vault secret"; fail=1; }
+fi
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --staged --no-banner --redact || { echo "✗ gitleaks: potential secret in staged changes"; fail=1; }
+fi
+[ "$fail" = 0 ] || { echo "  bypass (only if false positive): PSST_SKIP_SCAN=1 git commit | git commit --no-verify"; exit 1; }
+exit 0

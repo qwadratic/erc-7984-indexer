@@ -1,0 +1,39 @@
+{
+  "name": "erc7984-indexer",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "preflight": "node --env-file=.env.local --import tsx/esm scripts/preflight.ts",
+    "dev": "node --env-file=.env.local --import tsx/esm scripts/preflight.ts && ponder dev --port ${PORT:-42069}",
+    "start": "ponder start",
+    "db": "ponder db",
+    "codegen": "ponder codegen",
+    "lint": "eslint .",
+    "typecheck": "tsc",
+    "decrypt": "tsx scripts/decrypt-worker.ts",
+    "test": "tsx tests/runner.ts"
+  },
+  "dependencies": {
+    "pg": "^8.22.0",
+    "@hono/zod-validator": "^0.4.0",
+    "@openzeppelin/confidential-contracts": "0.4.0",
+    "@zama-fhe/sdk": "3.2.0-alpha.2",
+    "hono": "^4.12.27",
+    "p-limit": "^6.0.0",
+    "ponder": "^0.16.6",
+    "viem": "^2.53.1",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "eslint": "^8.56.0",
+    "eslint-config-ponder": "^0.16.6",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
