@@ -46,10 +46,9 @@ these are explicitly *not* in scope, captured so the trade-offs stay visible.
   counterparty interplay (the code is intentionally not aware of that distinction).
 
 ## Backlog — finalize local test plumbing (P3 prereq)
-- **Real FHE inputs in `tests/runner.ts`** — Phase-1 `confidentialTransfer` currently passes a
-  zero handle + empty proof placeholder; it cannot actually transfer. Generate real inputs via
-  the Zama SDK (`createEncryptedInput(token,user).add64(amount).encrypt()` → `{handles,inputProof}`)
-  so transfers execute and produce decryptable amount handles. **Blocks any spike run.**
+- **Real FHE inputs for Sepolia throughput** — the flow test (`tests/flow.e2e.ts`) now uses the SDK's
+  `cleartext()` transport locally (real encrypted inputs). On Sepolia, scale up `TRANSFER_COUNT`
+  for a meaningful throughput measurement.
 - **Budget-gated preflight** — given live `cast gas-price` + measured per-op gas (see
   recordings/runbook.md), compute max-affordable `SPIKE_N` and ABORT if the config would exceed
   the remaining ETH budget. Prevents running dry mid-test.

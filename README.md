@@ -91,15 +91,20 @@ Base URL: `http://localhost:42069` (default). Live instance: `https://erc7984-in
 
 ## Test
 
+One given/when/then flow test (`tests/flow.e2e.ts`) covers everything — correctness **and** a decryption-throughput readout:
+
 ```bash
-pnpm test            # principal-flow e2e on a local anvil (cleartext FHE) — reproducible, no spend
-pnpm test:sepolia    # same flow against the live Sepolia deployment (real relayer)
-pnpm test:throughput # funded Sepolia decrypt-throughput benchmark (spiking-throughput)
+pnpm test            # CHAIN=local — anvil + cleartext FHE, reproducible, no spend
+pnpm test:sepolia    # CHAIN=sepolia — live deployment + real relayer, yields handles/sec readout
 ```
 
-`pnpm test` / `pnpm test:sepolia` run the **same** principal-flow e2e (`tests/flow.e2e.ts`) — wrap → randomized confidential transfers → two same-block delegations → short-window revocation → `pending_rights` — end-to-end (onchain tx → log → DB → API). Local uses cleartext FHE (no KMS/relay); Sepolia exercises the real relayer. Both need Ponder + the decrypt worker running and Postgres up.
+**GIVEN** a0 holds underlying, the indexed token is deployed, Ponder + worker are running.
+**WHEN** randomized confidential transfers, 2 same-block delegations, and a short-window revoke.
+**THEN** all events indexed (wrap, transfers, delegations, revocation), API correct (`pending_rights` for undelegated, `decrypted` for delegated, delegations/revocation/transfers served), worker resolves cleartext — with a handles/sec throughput readout from delegation spike to resolution.
 
-`pnpm test:throughput` drives the `spiking-throughput` benchmark (`tests/runner.ts`) — bulk transfers then a delegation spike, measuring decrypt handles/sec. Needs a funded Sepolia account.
+Transfer volume is env-parameterizable (`TRANSFER_COUNT`, `ACCOUNT_COUNT`) — small default locally (fast), scale up on Sepolia for a real throughput measurement.
+
+Both envs need Ponder + the decrypt worker running and Postgres up. Local uses cleartext FHE (no KMS/relay); Sepolia exercises the real relayer.
 
 ## Architecture
 

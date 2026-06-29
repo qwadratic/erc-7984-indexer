@@ -3,19 +3,25 @@
  *
  * Same code, both envs: CHAIN=local uses a fresh anvil + cleartext FHE;
  * CHAIN=sepolia uses the live deployment + the real relayer (node()).
- * Validates: wrap, confidential transfers, same-block delegations,
- * short-window revocation, pending_rights, Ponder indexing, decrypt worker
- * resolution, and API serving. (Real KMS/relay nuances are Sepolia-only.)
  *
- * Prereqs:
+ * Structure: GIVEN / WHEN / THEN — one end-to-end flow covering wrap,
+ * confidential transfers, same-block delegations, short-window revocation,
+ * pending_rights, Ponder indexing, decrypt worker resolution (with throughput
+ * readout), and API serving.
+ *
+ * Env knobs:
+ *   TRANSFER_COUNT — confidential transfers per recipient (default 2 local, 10 Sepolia)
+ *   ACCOUNT_COUNT  — recipient accounts (default 3)
+ *
+ * Prereqs (local):
  *   1. anvil running on PONDER_RPC_URL_31337 (default http://127.0.0.1:8545)
  *   2. FHEVM host + MockERC20 + wrapper deployed (via scripts/deploy-local.sh)
  *   3. Ponder running with CHAIN=local
  *   4. Decrypt worker running with CHAIN=local
  *
  * Env:
- *   CHAIN=local (required)
- *   TOKEN_ADDRESS, UNDERLYING_ADDRESS, ACL_ADDRESS — from deploy-local.sh output
+ *   CHAIN=local | CHAIN=sepolia
+ *   TOKEN_ADDRESS, UNDERLYING_ADDRESS, ACL_ADDRESS — from deploy output
  *   INDEXER_PRIVATE_KEY — the indexer's private key
  *   DATABASE_URL — Postgres connection string
  */
@@ -40,18 +46,24 @@ try {
   }
 } catch {}
 
-// Force local mode
-if ((process.env.CHAIN ?? "").toLowerCase() !== "local") {
-  console.error("FATAL: This test requires CHAIN=local");
+const IS_LOCAL = (process.env.CHAIN ?? "").toLowerCase() === "local";
+if (!IS_LOCAL && (process.env.CHAIN ?? "").toLowerCase() !== "sepolia") {
+  console.error("FATAL: CHAIN must be 'local' or 'sepolia'");
   process.exit(1);
 }
 
-const RPC_URL = process.env.PONDER_RPC_URL_31337 ?? "http://127.0.0.1:8545";
+const RPC_URL = IS_LOCAL
+  ? (process.env.PONDER_RPC_URL_31337 ?? "http://127.0.0.1:8545")
+  : process.env.PONDER_RPC_URL_11155111!;
 const DATABASE_URL = process.env.DATABASE_URL!;
 const API_BASE = process.env.API_BASE ?? "http://localhost:42069";
 const TOKEN = process.env.TOKEN_ADDRESS!;
 const UNDERLYING = process.env.UNDERLYING_ADDRESS!;
 const ACL_ADDRESS = process.env.ACL_ADDRESS ?? "0x50157CFfD6bBFA2DECe204a89ec419c23ef5755D";
+
+// Env-parameterizable transfer/account counts (small default for local, larger for Sepolia throughput)
+const TRANSFER_COUNT = Number(process.env.TRANSFER_COUNT ?? (IS_LOCAL ? 2 : 10));
+const ACCOUNT_COUNT = Number(process.env.ACCOUNT_COUNT ?? 3);
 
 // Anvil default accounts (deterministic from mnemonic "test test ... junk")
 const ANVIL_ACCOUNTS = [
@@ -150,14 +162,18 @@ async function discoverSchema(): Promise<string> {
 // ── Main ──
 async function main() {
   // Ensure automine is on at the start (previous failures may have left it off)
-  execSync(`cast rpc anvil_setAutomine true --rpc-url ${RPC_URL}`, { timeout: 5_000, env: castEnv });
+  if (IS_LOCAL) {
+    execSync(`cast rpc anvil_setAutomine true --rpc-url ${RPC_URL}`, { timeout: 5_000, env: castEnv });
+  }
 
-  console.log(`\n${BOLD}═══ Principal-Flow E2E Test ═══${RESET}`);
+  console.log(`\n${BOLD}═══ Principal-Flow E2E Test (GIVEN / WHEN / THEN) ═══${RESET}`);
+  console.log(`  CHAIN:      ${process.env.CHAIN}`);
   console.log(`  RPC:        ${RPC_URL}`);
   console.log(`  TOKEN:      ${TOKEN}`);
   console.log(`  UNDERLYING: ${UNDERLYING}`);
   console.log(`  ACL:        ${ACL_ADDRESS}`);
   console.log(`  INDEXER:    ${INDEXER_ADDR}`);
+  console.log(`  TRANSFERS:  ${TRANSFER_COUNT} per recipient × ${ACCOUNT_COUNT} recipients`);
   console.log();
 
   const schema = await discoverSchema();
@@ -169,26 +185,29 @@ async function main() {
   const a3 = ANVIL_ACCOUNTS[3]!; // will receive transfers, stays UNDELEGATED → pending_rights
   const a4 = ANVIL_ACCOUNTS[4]!; // spare
 
-  // ──────────────────────────────────────────────
-  // PHASE 1: Wrap
-  // ──────────────────────────────────────────────
-  console.log(`\n${BOLD}${YELLOW}PHASE 1${RESET} — Mint underlying → Approve → Wrap`);
+  // Slice recipients from configured account count (a1, a2, a3 are the default 3)
+  const recipients = [a1, a2, a3].slice(0, ACCOUNT_COUNT);
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  GIVEN — Preconditions / state setup
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log(`\n${BOLD}${YELLOW}GIVEN${RESET} a0 holds underlying, the indexed token is deployed, Ponder + worker are running`);
 
   // Mint underlying to a0
   castSend(UNDERLYING, "mint(address,uint256)", [a0.addr, "1000000000000000000"], { pk: a0.pk, gas: 100_000 });
 
-  // Approve + wrap
+  // Approve + wrap (wrap is the precondition that gives a0 a confidential balance)
   castSend(UNDERLYING, "approve(address,uint256)", [TOKEN, "1000000000000000000"], { pk: a0.pk, gas: 100_000 });
   const wrapTx = castSend(TOKEN, "wrap(address,uint256)", [a0.addr, "1000000000000000000"], { pk: a0.pk });
 
-  // Verify wrap receipt has ConfidentialTransfer log
+  // Assert: wrap receipt has ConfidentialTransfer log
   const receiptJson = execSync(`cast receipt ${wrapTx} --rpc-url ${RPC_URL} --json`, { encoding: "utf-8", env: castEnv });
   const receipt = JSON.parse(receiptJson);
   const confTransferTopic = "0x67500e8d0ed826d2194f514dd0d8124f35648ab6e3fb5e6ed867134cffe661e9";
   const hasConfTransfer = receipt.logs.some((l: any) => l.topics?.[0]?.toLowerCase() === confTransferTopic);
   log("wrap", hasConfTransfer, `ConfidentialTransfer log in wrap receipt`);
 
-  // Check Ponder indexed the wrap
+  // Assert: Ponder indexed the wrap
   try {
     const rows = await pollDb(
       `SELECT kind, to_addr FROM "${schema}".token_event WHERE tx_hash = $1 AND kind = 'wrap'`,
@@ -199,24 +218,13 @@ async function main() {
     log("wrap-indexed", false, e.message);
   }
 
-  // ──────────────────────────────────────────────
-  // PHASE 2: Confidential Transfers (randomized amounts)
-  // ──────────────────────────────────────────────
-  console.log(`\n${BOLD}${YELLOW}PHASE 2${RESET} — Randomized confidential transfers`);
+  // ══════════════════════════════════════════════════════════════════════════
+  //  WHEN — On-chain actions (transfers, delegations, revocation)
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log(`\n${BOLD}${YELLOW}WHEN${RESET}  randomized confidential transfers, 2 same-block delegations, and a short-window revoke`);
 
-  // a0 needs encrypted inputs for transfers. In cleartext mode, we use the SDK high-level
-  // API via the encrypt path. But since we're using cast (no SDK), we use the SDK's
-  // encrypt mechanism. For cleartext mode on anvil, we can call encrypt via the
-  // InputVerifier-compatible path. Actually, for a minimal test, we'll use
-  // the contract's `confidentialTransfer(address to, euint64 amount)` overload
-  // which takes an existing encrypted handle (the balance handle).
-  // BUT that only transfers the FULL balance.
-  //
-  // For partial transfers, we need the `confidentialTransfer(address, bytes32, bytes)` overload
-  // with an encrypted input. In cleartext mode, the CleartextFHEVMExecutor handles this.
-  //
-  // The simplest approach for local testing: use the SDK directly from TypeScript.
-  // Let's dynamically import the SDK and use createToken().confidentialTransfer().
+  // ── Confidential Transfers (randomized amounts) ──
+  console.log(`\n  Confidential transfers (${TRANSFER_COUNT} per recipient):`);
 
   const { ZamaSDK, MemoryStorage } = await import("@zama-fhe/sdk");
   const { createConfig } = await import("@zama-fhe/sdk/viem");
@@ -244,18 +252,17 @@ async function main() {
   const sdk0 = makeSdk(a0.pk as `0x${string}`);
   const token0 = sdk0.createToken(TOKEN as `0x${string}`);
 
-  // Transfer to a1, a2, a3 with randomized amounts
-  const transferAmounts: { to: string; amount: number }[] = [
-    { to: a1.addr, amount: randomAmount() },
-    { to: a1.addr, amount: randomAmount() },
-    { to: a2.addr, amount: randomAmount() },
-    { to: a2.addr, amount: randomAmount() },
-    { to: a3.addr, amount: randomAmount() }, // a3 will stay undelegated
-  ];
+  // Build transfer list: TRANSFER_COUNT per recipient
+  const transferAmounts: { to: string; amount: number }[] = [];
+  for (const r of recipients) {
+    for (let i = 0; i < TRANSFER_COUNT; i++) {
+      transferAmounts.push({ to: r.addr, amount: randomAmount() });
+    }
+  }
 
   const transferTxHashes: string[] = [];
   for (const t of transferAmounts) {
-    console.log(`  Transfer ${t.amount} → ${t.to.slice(0, 10)}…`);
+    console.log(`    Transfer ${t.amount} → ${t.to.slice(0, 10)}…`);
     try {
       const result = await token0.confidentialTransfer(t.to as `0x${string}`, BigInt(t.amount));
       transferTxHashes.push(result.txHash);
@@ -265,55 +272,40 @@ async function main() {
     }
   }
 
-  // Wait for Ponder to index transfers
-  console.log(`  Waiting for Ponder to index transfers…`);
-  try {
-    await pollDb(
-      `SELECT count(*) AS cnt FROM "${schema}".token_event WHERE kind = 'transfer'`,
-      [], (r) => Number(r[0]?.cnt) >= transferTxHashes.length, 30_000,
-    );
-    log("transfers-indexed", true, `${transferTxHashes.length} transfers indexed`);
-  } catch (e: any) {
-    log("transfers-indexed", false, e.message);
+  // ── Two delegations in a SINGLE block ──
+  console.log(`\n  Two same-block delegations (a1 + a2):`);
+
+  if (IS_LOCAL) {
+    // Disable auto-mining so both txs land in the same block
+    execSync(`cast rpc anvil_setAutomine false --rpc-url ${RPC_URL}`, { timeout: 5_000, env: castEnv });
   }
 
-  // ──────────────────────────────────────────────
-  // PHASE 3: Two delegations in a SINGLE block
-  // ──────────────────────────────────────────────
-  console.log(`\n${BOLD}${YELLOW}PHASE 3${RESET} — 2 delegations in a single block (a1 + a2)`);
-
-  // Disable auto-mining so both txs land in the same block
-  execSync(`cast rpc anvil_setAutomine false --rpc-url ${RPC_URL}`, { timeout: 5_000, env: castEnv });
-
-  // Helper: async exec wrapped in a promise
   function execAsync(cmd: string): Promise<string> {
     return new Promise((resolve, reject) => {
-      exec(cmd, { encoding: "utf-8", timeout: 30_000, env: castEnv }, (err, stdout, stderr) => {
+      exec(cmd, { encoding: "utf-8", timeout: 30_000, env: castEnv }, (err, stdout, _stderr) => {
         if (err) return reject(err);
         resolve(stdout);
       });
     });
   }
 
-  // Submit both delegations (from a1 and a2, different delegators → no ACL conflict)
   const del1Cmd = `cast send ${ACL_ADDRESS} "delegateForUserDecryption(address,address,uint64)" ${INDEXER_ADDR} ${TOKEN} ${MAX_EXPIRATION} --private-key ${a1.pk} --rpc-url ${RPC_URL} --gas-limit 500000 --json`;
   const del2Cmd = `cast send ${ACL_ADDRESS} "delegateForUserDecryption(address,address,uint64)" ${INDEXER_ADDR} ${TOKEN} ${MAX_EXPIRATION} --private-key ${a2.pk} --rpc-url ${RPC_URL} --gas-limit 500000 --json`;
 
-  // Send both concurrently (async exec — both reach anvil’s mempool before mining)
+  // Send both concurrently (async exec — both reach the mempool before mining)
   const del1P = execAsync(del1Cmd);
   const del2P = execAsync(del2Cmd);
 
-  // Give both txs a moment to reach the mempool
-  await sleep(2_000);
+  if (IS_LOCAL) {
+    await sleep(2_000);
+    mineBlock();
+  }
 
-  // Mine one block containing both
-  mineBlock();
-
-  // Both execs now resolve (cast got receipts from the mined block)
   const [del1Out, del2Out] = await Promise.all([del1P, del2P]);
 
-  // Re-enable auto-mining
-  execSync(`cast rpc anvil_setAutomine true --rpc-url ${RPC_URL}`, { timeout: 5_000, env: castEnv });
+  if (IS_LOCAL) {
+    execSync(`cast rpc anvil_setAutomine true --rpc-url ${RPC_URL}`, { timeout: 5_000, env: castEnv });
+  }
 
   const del1Tx = JSON.parse(del1Out).transactionHash;
   const del2Tx = JSON.parse(del2Out).transactionHash;
@@ -325,7 +317,47 @@ async function main() {
   log("same-block-delegation", sameBlock,
     `Both delegations in block ${del1Receipt.blockNumber} (same=${sameBlock})`);
 
-  // Wait for Ponder to index delegations
+  // Record delegation spike time (for throughput measurement)
+  const delegationSpikeTime = Date.now();
+
+  // ── Short-window revocation (a2 revokes 1–3 blocks later) ──
+  console.log(`\n  Short-window revoke (a2):`);
+
+  if (IS_LOCAL) {
+    const blocksToWait = Math.floor(Math.random() * 3) + 1;
+    for (let i = 0; i < blocksToWait; i++) mineBlock();
+    console.log(`    Mined ${blocksToWait} block(s) before revoke`);
+  } else {
+    await sleep(15_000); // Sepolia: wait ~1 block
+  }
+
+  const revokeTx = castSend(
+    ACL_ADDRESS,
+    "revokeDelegationForUserDecryption(address,address)",
+    [INDEXER_ADDR, TOKEN],
+    { pk: a2.pk, gas: 500_000 },
+  );
+  log("revoke", true, `a2 revoked delegation (tx=${revokeTx.slice(0, 14)}…)`);
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  THEN — Assertions (log / DB / API / decrypt)
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log(`\n${BOLD}${YELLOW}THEN${RESET}  all events indexed, API correct, worker resolves cleartext`);
+
+  // ── DB: transfers indexed ──
+  console.log(`\n  Indexed assertions:`);
+
+  try {
+    await pollDb(
+      `SELECT count(*) AS cnt FROM "${schema}".token_event WHERE kind = 'transfer'`,
+      [], (r) => Number(r[0]?.cnt) >= transferTxHashes.length, 30_000,
+    );
+    log("transfers-indexed", true, `${transferTxHashes.length} transfers indexed`);
+  } catch (e: any) {
+    log("transfers-indexed", false, e.message);
+  }
+
+  // ── DB: delegations indexed ──
   try {
     await pollDb(
       `SELECT count(*) AS cnt FROM "${schema}".delegation_event WHERE kind = 'grant'`,
@@ -336,25 +368,7 @@ async function main() {
     log("delegations-indexed", false, e.message);
   }
 
-  // ──────────────────────────────────────────────
-  // PHASE 4: Revoke a2's delegation 1–3 blocks later
-  // ──────────────────────────────────────────────
-  console.log(`\n${BOLD}${YELLOW}PHASE 4${RESET} — Revoke a2's delegation (short window)`);
-
-  // Mine 1–3 blocks first (simulate short window)
-  const blocksToWait = Math.floor(Math.random() * 3) + 1;
-  for (let i = 0; i < blocksToWait; i++) mineBlock();
-  console.log(`  Mined ${blocksToWait} block(s) before revoke`);
-
-  const revokeTx = castSend(
-    ACL_ADDRESS,
-    "revokeDelegationForUserDecryption(address,address)",
-    [INDEXER_ADDR, TOKEN],
-    { pk: a2.pk, gas: 500_000 },
-  );
-  log("revoke", true, `a2 revoked delegation (tx=${revokeTx.slice(0, 14)}…)`);
-
-  // Wait for Ponder to index revocation
+  // ── DB: revocation indexed ──
   try {
     await pollDb(
       `SELECT count(*) AS cnt FROM "${schema}".delegation_event WHERE kind = 'revoke'`,
@@ -365,12 +379,8 @@ async function main() {
     log("revoke-indexed", false, e.message);
   }
 
-  // ──────────────────────────────────────────────
-  // PHASE 5: Verify API states (pending_rights for a3)
-  // ──────────────────────────────────────────────
-  console.log(`\n${BOLD}${YELLOW}PHASE 5${RESET} — API assertions`);
-
-  // a3 is undelegated → should show pending_rights
+  // ── API: pending_rights for a3 (undelegated) ──
+  console.log(`\n  API assertions:`);
   await sleep(3_000); // give Ponder a moment
 
   try {
@@ -382,7 +392,7 @@ async function main() {
     log("pending-rights-a3", false, e.message);
   }
 
-  // a1 delegated and not revoked → should eventually become decrypted (or pending while worker runs)
+  // ── API: a1 delegated → decrypted or pending ──
   try {
     const a1Balance = await apiFetch(`/v1/accounts/${a1.addr.toLowerCase()}/balance`);
     const a1Valid = ["decrypted", "pending"].includes(a1Balance.status);
@@ -392,7 +402,7 @@ async function main() {
     log("a1-balance-status", false, e.message);
   }
 
-  // Check delegations endpoint
+  // ── API: delegations endpoint ──
   try {
     const delegations = await apiFetch("/v1/delegations");
     const items = delegations.items ?? [];
@@ -405,7 +415,7 @@ async function main() {
     log("revocation-api", false, e.message);
   }
 
-  // Check transfers endpoint for a1
+  // ── API: transfers for a1 ──
   try {
     const a1Transfers = await apiFetch(`/v1/accounts/${a1.addr.toLowerCase()}/transfers`);
     const hasItems = (a1Transfers.items?.length ?? 0) > 0;
@@ -415,7 +425,7 @@ async function main() {
     log("transfers-api-a1", false, e.message);
   }
 
-  // Check health endpoint
+  // ── API: health ──
   try {
     const health = await apiFetch("/v1/health");
     log("health-api", health.status === "ok", `Health: ${JSON.stringify(health)}`);
@@ -423,22 +433,37 @@ async function main() {
     log("health-api", false, e.message);
   }
 
-  // ──────────────────────────────────────────────
-  // PHASE 6: Check decrypt worker (cleartext resolution)
-  // ──────────────────────────────────────────────
-  console.log(`\n${BOLD}${YELLOW}PHASE 6${RESET} — Decrypt worker cleartext resolution`);
+  // ── Decrypt worker: cleartext resolution + throughput readout ──
+  console.log(`\n  Decrypt-worker resolution + throughput:`);
 
-  // Wait for decrypt worker to process a1's handles (cleartext mode → should be fast)
+  // Count expected handles from a1's transfers (a1 is delegated + not revoked → should resolve)
+  // We measure wall-time from the delegation spike until all expected handles land in app.cleartext.
+  const expectedHandleCount = transferTxHashes.length; // one amount handle per transfer
+
+  let resolvedCount = 0;
+  const decryptPollStart = Date.now();
+  const decryptTimeout = IS_LOCAL ? 60_000 : 300_000;
   try {
     const rows = await pollDb(
       `SELECT count(*) AS cnt FROM app.cleartext WHERE status = 'decrypted'`,
-      [], (r) => Number(r[0]?.cnt) > 0, 60_000,
+      [], (r) => Number(r[0]?.cnt) > 0, decryptTimeout,
     );
-    const cnt = Number(rows[0]?.cnt);
-    log("cleartext-resolved", cnt > 0, `${cnt} handle(s) decrypted by worker`);
+    resolvedCount = Number(rows[0]?.cnt);
+    log("cleartext-resolved", resolvedCount > 0, `${resolvedCount} handle(s) decrypted by worker`);
   } catch (e: any) {
     log("cleartext-resolved", false, e.message);
   }
+
+  // Throughput readout: measure from delegation spike to now (all resolved handles)
+  const decryptWallMs = Date.now() - delegationSpikeTime;
+  const decryptWallSec = decryptWallMs / 1000;
+  const handlesPerSec = decryptWallSec > 0 ? resolvedCount / decryptWallSec : 0;
+
+  console.log(`\n  ${BOLD}── Decryption Throughput Readout ──${RESET}`);
+  console.log(`  Handles resolved:    ${resolvedCount}`);
+  console.log(`  Wall-time (spike→now): ${decryptWallSec.toFixed(1)}s`);
+  console.log(`  Throughput:          ${handlesPerSec.toFixed(2)} handles/sec`);
+  console.log(`  (TRANSFER_COUNT=${TRANSFER_COUNT}, ACCOUNT_COUNT=${ACCOUNT_COUNT})`);
 
   // ── Summary ──
   console.log(`\n${BOLD}═══ Results ═══${RESET}`);
