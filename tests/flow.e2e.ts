@@ -1,10 +1,11 @@
 /**
- * Local principal-flow e2e test.
+ * Principal-flow e2e test (env-agnostic — runs on local OR Sepolia via CHAIN).
  *
- * Runs the same sequence as the Sepolia test-plan against a local anvil
- * with cleartext FHE. Validates: wrap, confidential transfers, same-block
- * delegations, short-window revocation, pending_rights, Ponder indexing,
- * decrypt worker resolution, and API serving.
+ * Same code, both envs: CHAIN=local uses a fresh anvil + cleartext FHE;
+ * CHAIN=sepolia uses the live deployment + the real relayer (node()).
+ * Validates: wrap, confidential transfers, same-block delegations,
+ * short-window revocation, pending_rights, Ponder indexing, decrypt worker
+ * resolution, and API serving. (Real KMS/relay nuances are Sepolia-only.)
  *
  * Prereqs:
  *   1. anvil running on PONDER_RPC_URL_31337 (default http://127.0.0.1:8545)
@@ -151,7 +152,7 @@ async function main() {
   // Ensure automine is on at the start (previous failures may have left it off)
   execSync(`cast rpc anvil_setAutomine true --rpc-url ${RPC_URL}`, { timeout: 5_000, env: castEnv });
 
-  console.log(`\n${BOLD}═══ Local E2E Principal Flow Test ═══${RESET}`);
+  console.log(`\n${BOLD}═══ Principal-Flow E2E Test ═══${RESET}`);
   console.log(`  RPC:        ${RPC_URL}`);
   console.log(`  TOKEN:      ${TOKEN}`);
   console.log(`  UNDERLYING: ${UNDERLYING}`);

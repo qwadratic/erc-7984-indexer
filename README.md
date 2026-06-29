@@ -92,11 +92,14 @@ Base URL: `http://localhost:42069` (default). Live instance: `https://erc7984-in
 ## Test
 
 ```bash
-# Requires: Ponder + decrypt worker running, Postgres up, funded Sepolia account
-pnpm test
+pnpm test            # principal-flow e2e on a local anvil (cleartext FHE) — reproducible, no spend
+pnpm test:sepolia    # same flow against the live Sepolia deployment (real relayer)
+pnpm test:throughput # funded Sepolia decrypt-throughput benchmark (spiking-throughput)
 ```
 
-Runs the **golden-dataset test suite** — given/when/then scenarios defined in `tests/golden/scenarios.json`, driven end-to-end (onchain tx → log → DB → API).
+`pnpm test` / `pnpm test:sepolia` run the **same** principal-flow e2e (`tests/flow.e2e.ts`) — wrap → randomized confidential transfers → two same-block delegations → short-window revocation → `pending_rights` — end-to-end (onchain tx → log → DB → API). Local uses cleartext FHE (no KMS/relay); Sepolia exercises the real relayer. Both need Ponder + the decrypt worker running and Postgres up.
+
+`pnpm test:throughput` drives the `spiking-throughput` benchmark (`tests/runner.ts`) — bulk transfers then a delegation spike, measuring decrypt handles/sec. Needs a funded Sepolia account.
 
 ## Architecture
 

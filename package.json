@@ -12,8 +12,9 @@
     "lint": "eslint .",
     "typecheck": "tsc",
     "decrypt": "tsx scripts/decrypt-worker.ts",
-    "test": "tsx tests/runner.ts",
-    "test:local": "CHAIN=local tsx tests/local-e2e.ts"
+    "test": "CHAIN=local tsx tests/flow.e2e.ts",
+    "test:sepolia": "CHAIN=sepolia tsx tests/flow.e2e.ts",
+    "test:throughput": "tsx tests/runner.ts"
   },
   "dependencies": {
     "@hono/zod-validator": "^0.4.0",
