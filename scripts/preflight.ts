@@ -8,7 +8,7 @@
  */
 
 import { createPublicClient, http, type Address, getAddress } from "viem";
-import { sepolia } from "viem/chains";
+import { sepolia, hardhat } from "viem/chains";
 
 const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS as Address | undefined;
 if (!TOKEN_ADDRESS) {
@@ -18,10 +18,12 @@ if (!TOKEN_ADDRESS) {
 
 const addr = getAddress(TOKEN_ADDRESS);
 
-// Determine RPC URL from env (Ponder convention)
-const rpcUrl = process.env.PONDER_RPC_URL_11155111 ?? "http://127.0.0.1:8545";
+const isLocal = (process.env.CHAIN ?? "sepolia").toLowerCase() === "local";
+const rpcUrl = isLocal
+  ? (process.env.PONDER_RPC_URL_31337 ?? "http://127.0.0.1:8545")
+  : (process.env.PONDER_RPC_URL_11155111 ?? "http://127.0.0.1:8545");
 
-const chain = sepolia;
+const chain = isLocal ? hardhat : sepolia;
 
 const client = createPublicClient({
   chain,

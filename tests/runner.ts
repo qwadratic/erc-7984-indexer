@@ -36,11 +36,14 @@ try {
   }
 } catch {}
 
-const RPC_URL = process.env.PONDER_RPC_URL_11155111!;
+const IS_LOCAL = (process.env.CHAIN ?? "sepolia").toLowerCase() === "local";
+const RPC_URL = IS_LOCAL
+  ? (process.env.PONDER_RPC_URL_31337 ?? "http://127.0.0.1:8545")
+  : process.env.PONDER_RPC_URL_11155111!;
 const DATABASE_URL = process.env.DATABASE_URL!;
 const API_BASE = process.env.API_BASE ?? "http://localhost:42069";
-const TOKEN = process.env.TOKEN_ADDRESS ?? "0x46208622DA27d91db4f0393733C8BA082ed83158";
-const UNDERLYING = process.env.UNDERLYING_ADDRESS ?? "0xff54739b16576FA5402F211D0b938469Ab9A5f3F";
+const TOKEN = process.env.TOKEN_ADDRESS ?? (IS_LOCAL ? "0x0" : "0x46208622DA27d91db4f0393733C8BA082ed83158");
+const UNDERLYING = process.env.UNDERLYING_ADDRESS ?? (IS_LOCAL ? "0x0" : "0xff54739b16576FA5402F211D0b938469Ab9A5f3F");
 
 // Derive account[0] private key
 const MNEMONIC = execSync("psst get MNEMONIC", { encoding: "utf-8" }).trim();

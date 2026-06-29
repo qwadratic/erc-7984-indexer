@@ -95,22 +95,29 @@ import {
   DelegationNotPropagatedError,
 } from "@zama-fhe/sdk";
 import { createConfig } from "@zama-fhe/sdk/viem";
-import { node } from "@zama-fhe/sdk/node";
-import { sepolia as zamaSepolia } from "@zama-fhe/sdk/chains";
+import { node, cleartext } from "@zama-fhe/sdk/node";
+import { sepolia as zamaSepolia, hardhat as zamaHardhat } from "@zama-fhe/sdk/chains";
+import type { FheChain } from "@zama-fhe/sdk/chains";
 import {
   createPublicClient,
   createWalletClient,
   http,
   type Address,
   type Hex,
+  type Chain,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { sepolia } from "viem/chains";
+import { sepolia, hardhat } from "viem/chains";
+
+// ── Env switch ──
+const IS_LOCAL = (process.env.CHAIN ?? "sepolia").toLowerCase() === "local";
 
 // ── Config ──
 const TOKEN = (process.env.TOKEN_ADDRESS ?? "").toLowerCase() as Address;
 const INDEXER_PK = process.env.INDEXER_PRIVATE_KEY as `0x${string}`;
-const RPC_URL = process.env.PONDER_RPC_URL_11155111!;
+const RPC_URL = IS_LOCAL
+  ? (process.env.PONDER_RPC_URL_31337 ?? "http://127.0.0.1:8545")
+  : process.env.PONDER_RPC_URL_11155111!;
 const DATABASE_URL = process.env.DATABASE_URL!;
 // Gateway caps a decryption request at MAX_DECRYPTION_REQUEST_BITS = 2048 TOTAL encrypted
 // bits (proven: gateway-contracts/contracts/Decryption.sol:151 in zama-ai/fhevm; mirrored
@@ -130,6 +137,11 @@ await pool.query(`
     decrypted_at timestamptz NOT NULL DEFAULT now()
   );
   ALTER TABLE app.cleartext ADD COLUMN IF NOT EXISTS decrypted_at timestamptz NOT NULL DEFAULT now();
+  -- Ponder's live_query trigger on its tables references this helper table.
+  -- We create it so the worker's UPDATEs on Ponder tables don't fail.
+  CREATE TABLE IF NOT EXISTS live_query_tables (
+    table_name text PRIMARY KEY
+  );
 `);
 
 async function upsertCleartext(handle: string, value: bigint) {
@@ -151,29 +163,32 @@ let PONDER_SCHEMA = "public";
 }
 
 // ── SDK ──
+const viemChain: Chain = IS_LOCAL ? hardhat : sepolia;
 const account = privateKeyToAccount(INDEXER_PK);
 const publicClient = createPublicClient({
-  chain: sepolia,
+  chain: viemChain,
   transport: http(RPC_URL),
 });
 const walletClient = createWalletClient({
   account,
-  chain: sepolia,
+  chain: viemChain,
   transport: http(RPC_URL),
 });
 
-const chain = { ...zamaSepolia, network: RPC_URL } as const;
+const fheChain: FheChain = IS_LOCAL
+  ? { ...zamaHardhat, network: RPC_URL } as const satisfies FheChain
+  : { ...zamaSepolia, network: RPC_URL } as const satisfies FheChain;
 const sdk = new ZamaSDK(
   createConfig({
-    chains: [chain],
+    chains: [fheChain],
     publicClient: publicClient as any,
     walletClient: walletClient as any,
     storage: new MemoryStorage(),
-    relayers: { [chain.id]: node() },
+    relayers: { [fheChain.id]: IS_LOCAL ? cleartext() : node() },
   }),
 );
 
-console.log(`[decrypt-worker] SDK built, signer=${account.address}`);
+console.log(`[decrypt-worker] SDK built (${IS_LOCAL ? 'local/cleartext' : 'sepolia/node'}), signer=${account.address}`);
 
 // ── ABI for confidentialBalanceOf ──
 const BALANCE_ABI = [

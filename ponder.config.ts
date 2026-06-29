@@ -2,15 +2,19 @@ import { createConfig } from "ponder";
 import { ERC7984ERC20WrapperABI } from "./abis/ERC7984ERC20Wrapper";
 import { ERC20ABI } from "./abis/ERC20";
 import { ACLABI } from "./abis/ACL";
-import { TOKEN, UNDERLYING, ACL, INDEXER_ADDRESS } from "./src/config";
+import { TOKEN, UNDERLYING, ACL, INDEXER_ADDRESS, isLocal, CHAIN_ID, RPC_URL } from "./src/config";
 
 // Per-contract start blocks — all env-driven.
-const START_BLOCK = Number(process.env.START_BLOCK ?? 0);
+// Local always starts from block 0 (anvil genesis) regardless of .env.local's Sepolia START_BLOCK.
+const START_BLOCK = isLocal ? 0 : Number(process.env.START_BLOCK ?? 0);
 // Underlying may have been deployed earlier or at the same block as the wrapper.
-const UNDERLYING_START_BLOCK = Number(process.env.UNDERLYING_START_BLOCK ?? START_BLOCK);
+const UNDERLYING_START_BLOCK = isLocal ? 0 : Number(process.env.UNDERLYING_START_BLOCK ?? START_BLOCK);
 // ACL is network-wide busy; we only care about delegations to OUR indexer, which
 // are recent. A later ACL start + an indexed-arg filter keeps backfill cheap.
-const ACL_START_BLOCK = Number(process.env.ACL_START_BLOCK ?? START_BLOCK);
+const ACL_START_BLOCK = isLocal ? 0 : Number(process.env.ACL_START_BLOCK ?? START_BLOCK);
+
+// Chain name used as Ponder key — must be stable per chainId.
+const CHAIN_NAME = isLocal ? "local" : "sepolia";
 
 export default createConfig({
   database: {
@@ -18,23 +22,23 @@ export default createConfig({
     connectionString: process.env.DATABASE_URL!,
   },
   chains: {
-    sepolia: {
-      id: 11155111,
-      rpc: process.env.PONDER_RPC_URL_11155111!,
+    [CHAIN_NAME]: {
+      id: CHAIN_ID,
+      rpc: RPC_URL,
       // Throttle below the RPC's limit so backfill is steady instead of bursting
-      // into 429s + provider-inactive backoff. Free-tier Alchemy ~7 req/s → use ~5.
-      maxRequestsPerSecond: Number(process.env.MAX_RPS ?? 5),
+      // into 429s + provider-inactive backoff. Local anvil is unlimited.
+      maxRequestsPerSecond: isLocal ? 100 : Number(process.env.MAX_RPS ?? 5),
     },
   },
   contracts: {
     ERC7984ERC20Wrapper: {
-      chain: "sepolia",
+      chain: CHAIN_NAME,
       abi: ERC7984ERC20WrapperABI,
       address: TOKEN,
       startBlock: START_BLOCK,
     },
     Underlying: {
-      chain: "sepolia",
+      chain: CHAIN_NAME,
       abi: ERC20ABI,
       address: UNDERLYING,
       startBlock: UNDERLYING_START_BLOCK,
@@ -43,7 +47,7 @@ export default createConfig({
       filter: { event: "Transfer", args: { to: TOKEN } },
     },
     ACL: {
-      chain: "sepolia",
+      chain: CHAIN_NAME,
       abi: ACLABI,
       address: ACL,
       startBlock: ACL_START_BLOCK,
