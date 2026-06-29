@@ -4,23 +4,45 @@
 
 A wallet partner wants ERC-20-style reads over ERC-7984 confidential tokens. This indexer sits at the seam: FHE handles come in from the chain, cleartext rows go out through the API. The hard part isn't indexing events — it's that a transfer or balance can be **seen on-chain but not yet decryptable** (no delegation to us yet). We retain it, surface it honestly as `pending_rights`, and backfill cleartext the moment delegation lands. Because only our own accounts delegate to us, load is **spiky** — handles pile up, then accounts delegate near-simultaneously — so **decryption throughput under that spike is the core performance concern**.
 
+## Boundary & framing
+
+Three load-bearing choices that shape everything else.
+
+### Cleartext grinder, not an app
+
+We don't build auth or product logic. The boundary is deliberate: given capped relay resources, the complexity of the decryption algorithm, and what decryption physically depends on (a set of handles and the identities they're bound to), we grind cleartext. Auth, sessions, and revocation-UX belong to the wallet partner; staying agnostic to that is the design.
+
+### Decryption decoupled from indexing — for product reasons, not just SSR
+
+The Vite-SSR / `import.meta.resolve` incompatibility forced a separate process (`scripts/decrypt-worker.ts` runs as standalone `tsx`, outside Ponder's Vite context), but that's the small reason. The real one: all future value is in the decryption *scheduling* strategy — an almost-entirely offchain problem the indexing framework can't help with, except via cross-schema queries, which Ponder gives us. So indexer code never calls the SDK directly; it produces reorg-stable onchain tables (`token_event`, `balances`, `delegation_event`) that the offchain grinder reads to schedule and execute cleartext backfill. Indexing and decryption evolve independently.
+
+### Foundational, non-opinionated scheduling
+
+A working hypothesis, **not** baked into code: one decrypt primitive (batch or non-batch) for everything; never decrypt outdated balance handles — only HEAD; prioritize tail (latest) txs over historical, but still run historical backfill at a measurable, predictable completion rate we hold direct levers on. That rate is a *product lever* that changes with what users need from the API. The code keeps the strategy pivotable — the worker's per-delegator loop (balance gate → batch transfers, newest-first) is the current instantiation, not a hard-coded policy.
+
 ## Crucial decisions
 
-These few choices define the system; everything below is supporting detail.
+Supporting detail — each reinforces the framing above.
 
 1. **Access via a delegated indexer identity** — not per-user, per-request decrypt. The load-bearing product decision; see *Access model* below.
-2. **Retain the un-decryptable.** A transfer/balance seen on-chain but not yet decryptable is kept and surfaced as `pending_rights`, then backfilled to cleartext the instant delegation lands. Never dropped.
-3. **Log-only, zero-RPC indexing.** Handlers index logs only and capture *every* handle on the initial sync — backfill is pure log-fetch, nothing is missed, no archive-RPC bottleneck.
-4. **Throughput-first decrypt worker.** A separate worker schedules decryption in the right order — ~70% latest/current, ~30% historical — to survive the real load profile: handles accumulate, then our accounts delegate near-simultaneously, and we must decrypt + paginate fast.
-5. **Counterparty-dedup (FHE nuance).** A transfer amount handle is shared by both parties; once decrypted via either delegation it's reused, never re-decrypted — so a shared amount can read as `decrypted` for a counterparty who never delegated. `pending_rights` therefore applies to *balance* handles (per-user), not shared amounts.
+2. **Retain the un-decryptable.** On-chain but not yet decryptable → kept as `pending_rights`, backfilled to cleartext the instant delegation lands. Never dropped.
+3. **Log-only, zero-RPC indexing.** Handlers capture every handle on initial sync; backfill is pure log-fetch, no archive-RPC bottleneck.
+4. **Throughput-first decrypt worker.** Separate process, right ordering — balance/current first, transfers newest-first — to survive the real load profile: handles accumulate, accounts delegate near-simultaneously, and we must decrypt + paginate fast.
+5. **Counterparty-dedup (FHE nuance).** A transfer amount handle is shared by both parties; once decrypted via either delegation it's reused. `pending_rights` applies to *balance* handles (per-user), not shared amounts.
 
 ## Access model: indexer identity vs per-user decrypt
 
 Today's Zama apps decrypt **interactively**: a user signs a permit and decrypts their own handles, per-user and per-handle, at read time. That fits a UI with the user present; it does **not** fit an indexer that must serve ERC-20-style cleartext reads to a wallet backend with no user in the loop.
 
-Our decision: introduce a dedicated **indexer identity** (one EOA) that holds **delegated** decryption rights. Users delegate decryption for the token to the indexer (one ACL delegation), and the indexer decrypts on their behalf *ahead of read time*, serving cleartext straight from Postgres — the partner calls us and never touches FHE.
+Our decision: introduce a dedicated **indexer identity** (one EOA) that holds **delegated** decryption rights. Users delegate decryption for the token to the indexer via one `ACL.DelegatedForUserDecryption` event, and the indexer decrypts on their behalf *ahead of read time*, serving cleartext straight from Postgres — the partner calls us and never touches FHE.
 
-The one unusual requirement this puts on wallet integration: **keep the user's delegation active.** A delegation carries a TTL; to keep seeing cleartext the wallet re-asks the user to sign a delegation permit on some cadence. That renewal period is deliberately **left open until we measure realistic backfill/decryption speed** — the refresh cadence should follow from how fast we re-decrypt after a delegation lands, not a guess. (See the spiking-throughput test and `IDEAS.md`.)
+The one unusual requirement this puts on wallet integration: **keep the user's delegation active.** A delegation carries a TTL (`newExpirationDate`); to keep seeing cleartext the wallet re-asks the user to sign a delegation on some cadence. That renewal period is deliberately **left open until we measure realistic backfill/decryption speed** — the refresh cadence should follow from how fast we re-decrypt after a delegation lands, not a guess.
+
+Delegations can be granted **forever** (max-uint64 expiry, `18446744073709551615`) — once delegated and we're fast enough, the user effectively has permanent cleartext access through us.
+
+**Revocation ≠ erasure**: revoking (`ACL.RevokedDelegationForUserDecryption`) kills *live* access, not already-indexed cleartext. The `app.cleartext` table persists; the API continues to return previously-decrypted amounts while new balance reads fail (`pending_rights`). This is *why we ship no auth* — it surfaces, rather than papers over, the unsolved product questions (full onchain-twin reveal semantics? reveal A↔B amounts to B when only A delegated?).
+
+**Identity-leak risk**: the indexer key is a single point of compromise. Leak → mint a new identity + ask ALL users to revoke + re-delegate — hard to coordinate. Systematic mitigations (out of 4h scope, real-product depth): rotating identities, or per-user indexing identities.
 
 ## Architecture
 
@@ -40,29 +62,19 @@ Event handlers do NO `confidentialBalanceOf` / no `context.client.readContract`.
 - `Underlying:Transfer(to=TOKEN)` → wrap row with public cleartextAmount
 - `ConfidentialTransfer` → transfer/wrap/unwrap row with amountHandle
 - `UnwrapFinalized` → fill unwrap cleartextAmount
-- ACL grant/revoke → delegation_event
+- `ACL.DelegatedForUserDecryption` / `ACL.RevokedDelegationForUserDecryption` → delegation_event
 - On every transfer/wrap/unwrap: upsert a `balances` row for each non-zero `from`/`to` with `lastActivityBlock = event.block.number`, `stale = true`
 
 This makes backfill pure log fetching — fast, no archive RPC bottleneck.
 
 ### Per-contract start blocks
 
-Each contract has its own env-driven start block:
+Each contract has its own env-driven start block (`ponder.config.ts`):
 - `ERC7984ERC20Wrapper` ← `START_BLOCK` (token deploy block)
 - `Underlying` ← `UNDERLYING_START_BLOCK` (defaults to `START_BLOCK`)
 - `ACL` ← `ACL_START_BLOCK` (recent — network-wide busy; we only want our delegations)
 
-Combined with indexed-arg filters (`Underlying.Transfer to=TOKEN`, `ACL delegate=INDEXER`), this keeps log volume minimal.
-
-### Balances table (replaces `balance_handle`)
-
-**`balances`**: `(address, token) PK → balanceHandle (nullable), handleBlock (nullable), lastActivityBlock, stale`.
-
-- **Handlers** upsert affected holders with `stale = true` on every event — zero RPC.
-- **Decrypt worker** fills the current balance HANDLE at HEAD via ONE `confidentialBalanceOf(addr)` per stale delegated holder, then decrypts it.
-- Balance HISTORY is not stored — reconstructable from a holder's token_events (deferred; no endpoint).
-
-Rationale: backfill indexes only tx history (fast, log-only). Balances are a small derived table. Current balance handle is captured at HEAD. This separates the "what happened" (handlers, fast) from the "what is the current state" (worker, throttled).
+Combined with indexed-arg filters (`Underlying.Transfer to=TOKEN`, `ACL delegate=INDEXER_ADDRESS`), this keeps log volume minimal.
 
 ## Data Model
 
@@ -72,11 +84,11 @@ Rationale: backfill indexes only tx history (fast, log-only). Balances are a sma
 
 **`balances`** — `(address, token) PK → balanceHandle, handleBlock, lastActivityBlock, stale`. Handler marks stale on every event; worker refreshes handle at HEAD for delegated holders.
 
-**`app.cleartext`** — `cleartext(handle PK, value numeric, status text)`. The decrypt worker writes via `INSERT … ON CONFLICT DO UPDATE`. API reads via a separate `pg` pool.
+**`app.cleartext`** — `cleartext(handle PK, value numeric, status text, decrypted_at timestamptz)`. The decrypt worker writes via `INSERT … ON CONFLICT DO UPDATE`. API reads via a separate `pg` pool (`src/cleartext-store.ts`).
 
 ## Decrypt Worker Design
 
-The decryption pipeline is the hard part, not the indexing. **Premise:** keep every handle we can index on the initial sync, then immediately schedule decrypting all of them in the right order so the API can paginate as fast as possible. Ordering target: ~**70%** of each decrypt cycle on handles from the latest events / current balances, ~**30%** on historical backfill — newest-value-first, history catching up underneath. (Current cut: per-delegator balance/current first, then transfers newest-first; the explicit 70/30 weighting is a refinement — see Next priorities.)
+The decryption pipeline is the hard part, not the indexing.
 
 ### Per-delegator pass: balance gate → batch transfers
 
@@ -90,7 +102,7 @@ One loop, per readable delegator each tick:
 
 ### Counterparty-dedup
 
-Before decrypting any handle, skip it if it already exists in `app.cleartext`. A shared transfer-amount handle decrypted via one party is reused for the counterparty — never decrypt the same handle twice. This is checked explicitly before every decrypt batch.
+Before decrypting any handle, skip it if it already exists in `app.cleartext`. A shared transfer-amount handle decrypted via one party is reused for the counterparty — never decrypt the same handle twice. Checked explicitly via `getExistingHandles` before every decrypt batch.
 
 ### Relay parallelism
 
@@ -101,14 +113,6 @@ Relay concurrency is bounded by `delegatedBatchDecryptValues`' own `maxConcurren
 ## Amount-handle ACL persistence — RESOLVED ✓
 
 Empirically tested on Sepolia (2026-06-27): **transfer amount handles ARE NOT transient-ACL.** Both historical transfer amount handles and current balance handles successfully decrypted via `sdk.decryption.delegatedDecryptValues` after granting delegation from account[0] to the indexer.
-
-## Amount-handle cross-user visibility
-
-Transfer amount handles are shared between sender and receiver. Once decrypted via any delegator's access, the cleartext is globally available in `app.cleartext`. This means account[1]'s transfers may show `decrypted` amounts even without account[1]'s delegation — the handle was decrypted via account[0]'s delegation. The `pending_rights` status applies to **balance** handles, which are per-user and require that specific user's delegation.
-
-## Revocation ≠ erasure
-
-Already-decrypted cleartext persists after delegation revoke. The API continues to return previously-decrypted amounts. New balance reads fail (`pending_rights`), but historical data is retained.
 
 ## Key Addresses
 
@@ -121,17 +125,21 @@ Already-decrypted cleartext persists after delegation revoke. The API continues 
 
 Secrets via `psst` CLI: `MNEMONIC` (shared anvil + seed), `SEPOLIA_RPC_URL` (Alchemy archive).
 
-## Next priorities (next 4h)
+## Reflection
 
-1. **Weighted decrypt scheduler** — enforce the ~70/30 latest-vs-historical batch mix so pagination stays fast under deep history (current cut: balance/current first, transfers newest-first).
-2. **Pending-decryption tracking** — track undecrypted handles per delegator (`cleartext_amount IS NULL`, absent from `app.cleartext`) to drive cleartext backfill scheduling/optimization.
-3. **Adaptive relay parallelism** — auto-tune `maxConcurrency` based on 429 rates. Currently static `DECRYPT_RELAY_CONCURRENCY`.
-4. **Full unwrap lifecycle** — `UnwrapRequested` tracking for in-progress visibility (currently only `UnwrapFinalized` indexed).
-5. **Dedicated relayer** — escape shared Sepolia relayer rate limits if `429`s become frequent.
-6. **Multi-token** — generalize config to index N wrappers with shared decrypt pipeline.
+### Least confident under load
+
+Premise: RPC with decent rate limits → fresh sync fast, resyncs cheap (Ponder cache + reindex strategies). ERC-20-style transfer-event indexing is the dominant, community-optimized path → assumed NOT the bottleneck. So the weakest link is decryption, deliberately made independent of indexing (it only needs handles + the identities they're bound to, treated as given). The spiking-throughput test (`tests/runner.ts`, scenario `spiking-throughput`) exists to prove exactly that boundary — what breaks first is relayer throughput / propagation under a simultaneous-delegation spike; the test measures handles/sec on the fresh per-run delta to prove it.
+
+### Time sink
+
+Most cognitive load went to finding the right way to attack the bottleneck: kept focus on decryption, stood up the detached `app.cleartext` schema early, then hunted (taste-guided) for the undocumented SDK methods that batch *pure* handle decryption — not envelopes like `confidentialBalanceOf` (great for a balance; no equivalent for handles embedded in events). The belief that a low-level batch decrypt exists (`delegatedBatchDecryptValues`) and can be scheduled cleverly was the journey; not certain the current solution is optimal. Also invested early in understanding propagation and pre-empting pitfalls before the first line of code.
+
+### AI assistance
+
+I used AI on three fronts — (1) ramping fast on protocol architecture and the undocumented SDK surface; (2) externalizing, ordering, and prioritizing a flood of ideas; (3) a first autonomous agentic coding session that produced a working demo but with mediocre code/doc taste, then a second iterative session to make implementation + docs coherent and sharp. Failure mode worth naming: LLMs confidently hallucinate event names and SDK methods for code not in their weights; the fix is to co-pilot — keep the agent grounded in the actual repo and point it at the load-bearing specifics. Two concrete catches: it fabricated ACL event names/args (corrected by reading the actual `ACLABI` — the real events are `DelegatedForUserDecryption` and `RevokedDelegationForUserDecryption`), and it omitted a local-dev stack entirely — which turned out correct, since real decryption needs Sepolia relays and a local fhEVM would have optimized the wrong thing.
 
 ## SDK Feedback
 
-1. **`delegatedBatchDecryptValues` is undiscoverable.** The delegated-decryption guide reads as balance-only. The generic batch method isn't cross-linked. **P1.**
-2. **`DelegationNotPropagatedError` needs a readiness signal.** No `isPropagated()` or `waitForPropagation()`. **P1.**
-3. **Cleartext relayer is a semantic cliff.** `cleartext()` transport decrypts instantly, silently skips ACL enforcement. **P2.**
+1. **Batch vs non-batch decrypt — error/partial-failure semantics are under-documented.** Both `delegatedDecryptValues` and `delegatedBatchDecryptValues` are easy to find, but the difference in failure handling isn't clear from docs; had to empirically research relayer-side batch limits to choose safely.
+2. **Propagation-readiness needs docs (not an API).** A universal `isPropagated()` can't exist — it needs an offchain source of truth, and the SDK correctly trusts onchain truth. That's the right call, but it should be surfaced/documented so integrators build a propagation gate instead of hitting `DelegationNotPropagatedError` blind.
