@@ -6,7 +6,7 @@ import { replaceBigInts } from "ponder";
 import { db } from "ponder:api";
 import { tokenEvent, balances, delegationEvent } from "ponder:schema";
 import { eq, or, and, desc, lt } from "ponder";
-import { getCleartextBatch, getRecentDecryptCount } from "../cleartext-store";
+import { getCleartextBatch, getRecentDecryptCount, getHandleEconomics, getBalanceHandle, getIndexedHead, getQueueDepth } from "../cleartext-store";
 import { isReadable, readableDelegators } from "../delegations";
 import { TOKEN } from "../config";
 
@@ -70,7 +70,9 @@ app.get(
       });
     }
 
-    const handle = bal[0].balanceHandle;
+    // Balance handle is worker-owned, in app.balance_handle (not Ponder's table).
+    const bh = await getBalanceHandle(TOKEN, address);
+    const handle = bh?.handle ?? null;
     if (!handle) {
       const readable = await isReadable(db, address);
       return c.json({
@@ -195,7 +197,11 @@ app.get(
 );
 
 // GET /v1/health
-// decryptedLast15m = handles the worker decrypted in the last 15 minutes (liveness signal)
+// indexedBlock   = Ponder's true sync head (compare to chain HEAD to judge "caught up").
+// lastEventBlock = last block that produced a token event — only moves on token activity,
+//                  so it can sit well behind HEAD while fully synced (NOT sync lag).
+// pendingHandles = distinct undecrypted transfer handles = decryption queue depth.
+// decryptedLast15m = handles decrypted in the last 15 min (worker liveness).
 app.get("/v1/health", async (c) => {
   const latest = await db
     .select()
@@ -205,23 +211,59 @@ app.get("/v1/health", async (c) => {
   const delegators = await readableDelegators(db);
 
   let decryptedLast15m = 0;
-  try {
-    decryptedLast15m = await getRecentDecryptCount(15);
-  } catch {
-    // cleartext table may not exist yet
-  }
+  let indexedBlock: bigint | null = null;
+  let pendingHandles = 0;
+  try { decryptedLast15m = await getRecentDecryptCount(15); } catch {}
+  try { indexedBlock = await getIndexedHead(); } catch {}
+  try { pendingHandles = await getQueueDepth(); } catch {}
 
   return c.json(
     replaceBigInts(
       {
         status: "ok",
-        headBlock: latest[0]?.blockNumber ?? null,
+        indexedBlock,                                   // true sync head (≈ chain HEAD when caught up)
+        lastEventBlock: latest[0]?.blockNumber ?? null, // last block with a token event (not sync lag)
+        pendingHandles,                                 // decryption queue depth
         decryptedLast15m,
         readableUsers: delegators.length,
       },
       String,
     ),
   );
+});
+
+// GET /v1/economics
+// The "automatic win", observable. dedupMultiplier = handle references ÷ distinct
+// ciphertext = how much decrypt work the distinct-handle index gate folds away.
+// ~2 = gas-bound entropy token (cWETH); ≫2 = index-bound structural token. See ECONOMICS.md.
+const GAS_PER_TRANSFER = 460_000; // runbook.md, real Sepolia receipt
+const GWEI = 6.7; // runbook.md observed; ideally live cast gas-price
+const PER_HANDLE_S = 2.45 / (28 * 10); // round-trip / (batch-28 × conc-10), warm
+app.get("/v1/economics", async (c) => {
+  let econ;
+  try {
+    econ = await getHandleEconomics();
+  } catch {
+    return c.json({ error: "economics unavailable (tables not ready)" }, 503);
+  }
+  const decryptSecondsSaved =
+    (econ.naiveDecryptAttempts - econ.distinctHandles) * PER_HANDLE_S;
+  const gasGeneratedEth = econ.distinctHandles * GAS_PER_TRANSFER * GWEI * 1e-9;
+  // dedupMultiplier ~2 = entropy token (cWETH); >3 means structural ciphertext reuse, so
+  // the index has gone from a 2x nicety to load-bearing. Threshold documented in ECONOMICS.md.
+  const regime =
+    econ.dedupMultiplier > 3 ? "index-bound (structural reuse)" : "gas-bound (entropy)";
+  return c.json({
+    naiveDecryptAttempts: econ.naiveDecryptAttempts, // what a no-index worker would attempt (from/to ×2 + balances)
+    distinctHandles: econ.distinctHandles, // real decrypt work
+    decryptedHandles: econ.decryptedHandles,
+    dedupMultiplier: Number(econ.dedupMultiplier.toFixed(3)),
+    cleartextBytes: econ.distinctHandles * 8,
+    decryptSecondsSaved: Number(decryptSecondsSaved.toFixed(2)),
+    gasGeneratedEthAt6_7Gwei: Number(gasGeneratedEth.toFixed(4)), // STALE price — runbook.md @6.7gwei, not live
+    regime,
+    notes: "warm decrypt constants; gas est = distinctHandles × 460k @6.7gwei (runbook.md), not live gas price",
+  });
 });
 
 // GET /v1/delegations

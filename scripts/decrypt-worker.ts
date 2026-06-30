@@ -20,56 +20,18 @@
  * A shared transfer-amount handle decrypted via one party is reused for the counterparty.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { hostname } from "node:os";
 
-// ── PID lock: single-instance guard ──
-const LOCK_FILE = resolve(import.meta.dirname ?? ".", "..", ".decrypt-worker.lock");
-
-function acquireLock(): void {
-  if (existsSync(LOCK_FILE)) {
-    try {
-      const raw = readFileSync(LOCK_FILE, "utf-8").trim();
-      const pid = Number(raw);
-      if (Number.isFinite(pid) && pid > 0) {
-        try {
-          process.kill(pid, 0); // throws ESRCH if dead
-          console.log(`[decrypt-worker] another instance is running (pid ${pid}) — exiting`);
-          process.exit(1);
-        } catch (e: any) {
-          if (e?.code !== "ESRCH") throw e; // unexpected error
-          // stale lock — fall through
-        }
-      }
-    } catch (e: any) {
-      if (e?.code === "ENOENT") { /* race: file vanished */ }
-      else if (typeof e?.code === "string" && e.code === "ESRCH") { /* handled above */ }
-      else if (e !== undefined && (e as any).message?.includes("exiting")) throw e;
-      // garbage file — fall through
-    }
-  }
-  writeFileSync(LOCK_FILE, String(process.pid), "utf-8");
-}
-
-function releaseLock(): void {
-  try {
-    if (existsSync(LOCK_FILE)) {
-      const content = readFileSync(LOCK_FILE, "utf-8").trim();
-      if (content === String(process.pid)) {
-        unlinkSync(LOCK_FILE);
-      }
-    }
-  } catch {}
-}
-
-acquireLock();
-
-process.on("exit", releaseLock);
-process.on("SIGINT", () => { releaseLock(); process.exit(130); });
-process.on("SIGTERM", () => { releaseLock(); process.exit(143); });
+// ── Parallel-friendly: NO single-instance lock. ──
+// Multiple workers may run concurrently and split the backlog via per-handle DB row-claims
+// in app.cleartext (claimHandles below) — each distinct handle is decrypted by exactly one
+// worker. Scale out by launching N processes (set DECRYPT_WORKER_ID=<n> for log clarity).
+process.on("SIGINT", () => process.exit(130));
+process.on("SIGTERM", () => process.exit(143));
 process.on("uncaughtException", (err) => {
   console.error("[decrypt-worker] uncaughtException:", err);
-  releaseLock();
   process.exit(1);
 });
 
@@ -128,6 +90,11 @@ const HANDLES_PER_REQUEST = 28;
 // ── Postgres ──
 const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 5 });
 
+// Worker-owned side tables (app.*). The worker writes ONLY here — never into a
+// Ponder-managed table. Ponder installs an AFTER INSERT/UPDATE/DELETE row trigger
+// on its tables that snapshots into _reorg__<table>; an out-of-band UPDATE there
+// would inject phantom rows into Ponder's reorg log and get clobbered on revert.
+// Keeping handles in app.* avoids that entirely and survives schema redeploys.
 await pool.query(`
   CREATE SCHEMA IF NOT EXISTS app;
   CREATE TABLE IF NOT EXISTS app.cleartext (
@@ -137,17 +104,23 @@ await pool.query(`
     decrypted_at timestamptz NOT NULL DEFAULT now()
   );
   ALTER TABLE app.cleartext ADD COLUMN IF NOT EXISTS decrypted_at timestamptz NOT NULL DEFAULT now();
-  -- Ponder's live_query trigger on its tables references this helper table.
-  -- We create it so the worker's UPDATEs on Ponder tables don't fail.
-  CREATE TABLE IF NOT EXISTS live_query_tables (
-    table_name text PRIMARY KEY
+  ALTER TABLE app.cleartext ADD COLUMN IF NOT EXISTS claimed_by text;
+  ALTER TABLE app.cleartext ADD COLUMN IF NOT EXISTS claimed_at timestamptz;
+  CREATE TABLE IF NOT EXISTS app.balance_handle (
+    token        text NOT NULL,
+    address      text NOT NULL,
+    handle       text,
+    handle_block numeric,
+    captured_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (token, address)
   );
 `);
 
 async function upsertCleartext(handle: string, value: bigint) {
   await pool.query(
     `INSERT INTO app.cleartext (handle, value, status, decrypted_at) VALUES ($1, $2, 'decrypted', now())
-     ON CONFLICT (handle) DO UPDATE SET value = EXCLUDED.value, status = 'decrypted', decrypted_at = now()`,
+     ON CONFLICT (handle) DO UPDATE SET value = EXCLUDED.value, status = 'decrypted', decrypted_at = now(),
+       claimed_by = NULL, claimed_at = NULL`,
     [handle.toLowerCase(), value.toString()],
   );
 }
@@ -225,28 +198,44 @@ async function getDelegators(): Promise<Address[]> {
   return result;
 }
 
-async function getBalanceRow(
+/**
+ * Balance state = indexer activity (READ-ONLY from Ponder's balances) joined with
+ * the worker's own captured handle (app.balance_handle). A pure SELECT on Ponder's
+ * table does NOT fire its reorg trigger, so reading is safe; we just never write it.
+ * Staleness is derived: recapture iff no handle yet OR handle_block < lastActivityBlock.
+ */
+async function getBalanceState(
   addr: Address,
-): Promise<{ handle: Hex | null; stale: boolean } | null> {
-  const { rows } = await pool.query(
-    `SELECT balance_handle, stale FROM "${PONDER_SCHEMA}".balances
+): Promise<{ handle: Hex | null; handleBlock: bigint | null; lastActivityBlock: bigint | null }> {
+  const { rows: act } = await pool.query(
+    `SELECT last_activity_block FROM "${PONDER_SCHEMA}".balances
      WHERE address = $1 AND token = $2`,
     [addr.toLowerCase(), TOKEN],
   );
-  if (rows.length === 0) return null;
-  return { handle: (rows[0].balance_handle as Hex) ?? null, stale: rows[0].stale };
+  const lastActivityBlock =
+    act[0]?.last_activity_block != null ? BigInt(act[0].last_activity_block) : null;
+  const { rows: h } = await pool.query(
+    `SELECT handle, handle_block FROM app.balance_handle WHERE token = $1 AND address = $2`,
+    [TOKEN, addr.toLowerCase()],
+  );
+  return {
+    handle: (h[0]?.handle as Hex) ?? null,
+    handleBlock: h[0]?.handle_block != null ? BigInt(h[0].handle_block) : null,
+    lastActivityBlock,
+  };
 }
 
-async function updateBalanceHandle(
+async function upsertBalanceHandle(
   address: Address,
   handle: Hex,
   block: bigint,
 ) {
   await pool.query(
-    `UPDATE "${PONDER_SCHEMA}".balances
-     SET balance_handle = $1, handle_block = $2, stale = false
-     WHERE address = $3 AND token = $4`,
-    [handle, block.toString(), address.toLowerCase(), TOKEN],
+    `INSERT INTO app.balance_handle (token, address, handle, handle_block, captured_at)
+     VALUES ($1, $2, $3, $4, now())
+     ON CONFLICT (token, address)
+     DO UPDATE SET handle = EXCLUDED.handle, handle_block = EXCLUDED.handle_block, captured_at = now()`,
+    [TOKEN, address.toLowerCase(), handle, block.toString()],
   );
 }
 
@@ -270,18 +259,46 @@ async function getTransferHandles(
   return rows.map((r: any) => r.amount_handle as Hex);
 }
 
+// ── Parallel work-split via DB row-claims ──
+// WORKER_ID identifies this process; CLAIM_TTL bounds how long a claim is honored before
+// another worker may steal it (covers a crashed worker that died mid-decrypt).
+const WORKER_ID = process.env.DECRYPT_WORKER_ID ?? `${hostname()}:${process.pid}`;
+const CLAIM_TTL_SEC = Number(process.env.DECRYPT_CLAIM_TTL_SEC ?? 120);
+
 /**
- * Counterparty-dedup: check which handles are already decrypted in app.cleartext.
- * A shared transfer-amount handle decrypted via one party is reused for the
- * counterparty — never decrypt the same handle twice.
+ * Atomically claim handles for THIS worker; returns the subset actually won. Claimable =
+ * brand-new, released ('pending'), or a stale claim (older than CLAIM_TTL). Never re-claims
+ * a 'decrypted' row or one freshly claimed by another worker. This single statement is how
+ * parallel workers split the backlog with no single-instance lock and no double-decrypt:
+ * Postgres serializes the conflicting upserts, the status + TTL guard does the rest. It
+ * also subsumes counterparty-dedup — a shared handle is won (and decrypted) exactly once.
  */
-async function getExistingHandles(handles: string[]): Promise<Set<string>> {
-  if (handles.length === 0) return new Set();
+async function claimHandles(handles: Hex[]): Promise<Hex[]> {
+  if (handles.length === 0) return [];
+  const lower = [...new Set(handles.map((h) => h.toLowerCase()))];
   const { rows } = await pool.query(
-    `SELECT handle FROM app.cleartext WHERE handle = ANY($1)`,
-    [handles.map((h) => h.toLowerCase())],
+    `INSERT INTO app.cleartext (handle, status, claimed_by, claimed_at)
+     SELECT unnest($1::text[]), 'claimed', $2, now()
+     ON CONFLICT (handle) DO UPDATE
+       SET status = 'claimed', claimed_by = $2, claimed_at = now()
+       WHERE app.cleartext.status <> 'decrypted'
+         AND (app.cleartext.claimed_at IS NULL
+              OR app.cleartext.claimed_at < now() - ($3 || ' seconds')::interval)
+     RETURNING handle`,
+    [lower, WORKER_ID, String(CLAIM_TTL_SEC)],
   );
-  return new Set(rows.map((r: any) => r.handle));
+  const won = new Set(rows.map((r: any) => r.handle as string));
+  return handles.filter((h) => won.has(h.toLowerCase()));
+}
+
+/** Release our own unfulfilled claims (decrypt failed / not propagated) so they retry. */
+async function releaseHandles(handles: Hex[]): Promise<void> {
+  if (handles.length === 0) return;
+  await pool.query(
+    `UPDATE app.cleartext SET status = 'pending', claimed_by = NULL, claimed_at = NULL
+     WHERE handle = ANY($1) AND status = 'claimed' AND claimed_by = $2`,
+    [handles.map((h) => h.toLowerCase()), WORKER_ID],
+  );
 }
 
 // ── Decrypt ──
@@ -340,9 +357,28 @@ const RELAY_CONCURRENCY = Number(process.env.DECRYPT_RELAY_CONCURRENCY ?? 10);
 const ZERO_HANDLE =
   "0x0000000000000000000000000000000000000000000000000000000000000000";
 
+// Per-tick parallelism. The relayer rewards concurrent batches (measured ~2.3× at P=8), and a
+// serial per-delegator loop pays one round-trip per delegator just for the balance gate.
+// DELEGATOR_CONCURRENCY overlaps the balance-gate round-trips across delegators; CHUNK_CONCURRENCY
+// overlaps one delegator's transfer batches. The DB row-claim stays the authority on who decrypts
+// each handle, so this added concurrency never double-decrypts — it only overlaps the waiting.
+const DELEGATOR_CONCURRENCY = Number(process.env.DECRYPT_DELEGATOR_CONCURRENCY ?? 4);
+const CHUNK_CONCURRENCY = Number(process.env.DECRYPT_CHUNK_CONCURRENCY ?? 4);
+
+function pLimit(n: number) {
+  let active = 0;
+  const queue: (() => void)[] = [];
+  const next = () => { active--; queue.shift()?.(); };
+  return <T>(fn: () => Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      const run = () => { active++; fn().then(resolve, reject).finally(next); };
+      active < n ? run() : queue.push(run);
+    });
+}
+
 // Batch-decrypt transfer amounts with per-entry error isolation: one bad/unpropagated
 // handle doesn't sink the whole chunk. The SDK bounds its own fallback parallelism via
-// maxConcurrency (= DECRYPT_RELAY_CONCURRENCY) — no external pLimit needed.
+// maxConcurrency (= DECRYPT_RELAY_CONCURRENCY), so we don't manage concurrency here.
 async function tryBatchDecrypt(
   delegator: Address,
   handles: Hex[],
@@ -383,7 +419,7 @@ async function tryBatchDecrypt(
 }
 
 async function runLoop() {
-  console.log("[decrypt-worker] Starting main loop (balance gate → batch transfers)...");
+  console.log(`[decrypt-worker] Starting main loop (worker=${WORKER_ID}, claim-split, balance gate → batch transfers)...`);
   while (true) {
     try {
       // Check if Ponder tables exist yet
@@ -412,71 +448,126 @@ async function runLoop() {
         await sleep(5_000);
         continue;
       }
+      // Shuffle so N parallel workers don't lockstep on the same delegator order — spreads
+      // claim contention and keeps each worker drawing from a different part of the frontier.
+      for (let i = delegators.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [delegators[i], delegators[j]] = [delegators[j]!, delegators[i]!];
+      }
 
       let totalDecrypted = 0;
 
-      // Per delegator: (1) refresh + decrypt the current balance as a propagation gate,
-      // (2) if propagated, batch-decrypt that delegator's undecrypted transfer amounts.
-      for (const delegator of delegators) {
-        try {
-          // ── (1) Current balance handle (refresh at HEAD on new activity) ──
-          const row = await getBalanceRow(delegator);
-          let handle: Hex | null = row?.handle ?? null;
-          if (!row || row.stale || !handle) {
-            const head = (await publicClient.readContract({
-              address: TOKEN,
-              abi: BALANCE_ABI,
-              functionName: "confidentialBalanceOf",
-              args: [delegator as `0x${string}`],
-            })) as Hex;
-            const blockNum = await publicClient.getBlockNumber();
-            await updateBalanceHandle(delegator, head, blockNum);
-            handle = head;
-          }
+      // ── Distinct-handle index gate (the structural lever) ──
+      // A handle is a content identifier: identical ciphertext ⇒ identical bytes32.
+      // So decrypt work should scale with DISTINCT unseen ciphertext, not with handle
+      // count. A big-structure token (ConfidentialBasketMock) emits K handles/transfer
+      // but reuses a structural template handle for K-1 of them; without this gate the
+      // worker pays K relayer round-trips/transfer and the boundary collapses as ~1/K.
+      // This tick-scoped index folds the inflation away: each distinct handle is
+      // decrypted at most once per tick (and never if already in app.cleartext), across
+      // ALL delegators — so the break-even on-chain rate stops depending on K.
+      const seenThisTick = new Set<string>();
 
-          // ── (2) Propagation gate: a successful balance decrypt confirms propagation.
-          //         Not propagated → skip this delegator this tick.
-          let propagated = true;
-          if (handle && handle !== ZERO_HANDLE) {
-            const existing = await getExistingHandles([handle]);
-            if (!existing.has(handle.toLowerCase())) {
-              const res = await tryDecrypt(delegator, [handle]);
-              if (res === "not_propagated") {
-                propagated = false;
-              } else {
-                for (const r of res) {
-                  await upsertCleartext(r.handle, r.value);
-                  totalDecrypted++;
+      // Per delegator (bounded-concurrency parallel — overlaps the relayer round-trips):
+      // (1) refresh + decrypt the current balance as a propagation gate,
+      // (2) if propagated, batch-decrypt that delegator's undecrypted transfer amounts.
+      const delegatorLimit = pLimit(DELEGATOR_CONCURRENCY);
+      const perDelegatorCounts = await Promise.all(
+        delegators.map((delegator) =>
+          delegatorLimit(async () => {
+            let count = 0;
+            try {
+              // ── (1) Current balance handle (refresh at HEAD on new activity) ──
+              // Derived staleness: recapture when the worker has no handle yet, or the
+              // captured handle predates the latest indexed activity for this holder.
+              const bs = await getBalanceState(delegator);
+              let handle: Hex | null = bs.handle;
+              const needsRecapture =
+                !handle ||
+                bs.handleBlock == null ||
+                (bs.lastActivityBlock != null && bs.handleBlock < bs.lastActivityBlock);
+              if (needsRecapture) {
+                const head = (await publicClient.readContract({
+                  address: TOKEN,
+                  abi: BALANCE_ABI,
+                  functionName: "confidentialBalanceOf",
+                  args: [delegator as `0x${string}`],
+                })) as Hex;
+                const blockNum = await publicClient.getBlockNumber();
+                await upsertBalanceHandle(delegator, head, blockNum);
+                handle = head;
+              }
+
+              // ── (2) Propagation gate: claim the balance handle, decrypt it. A successful
+              //         decrypt confirms propagation; not-propagated → release + skip delegator.
+              //         If another worker already owns/decrypted it, proceed optimistically (a
+              //         per-item not_propagated on the transfers will gate us anyway).
+              let propagated = true;
+              if (handle && handle !== ZERO_HANDLE) {
+                seenThisTick.add(handle.toLowerCase());
+                const claimedBal = await claimHandles([handle]);
+                if (claimedBal.length > 0) {
+                  const res = await tryDecrypt(delegator, [handle]);
+                  if (res === "not_propagated") {
+                    propagated = false;
+                    await releaseHandles([handle]);
+                  } else {
+                    for (const r of res) {
+                      await upsertCleartext(r.handle, r.value);
+                      count++;
+                    }
+                  }
                 }
               }
-            }
-          }
-          if (!propagated) continue;
+              if (!propagated) return count;
 
-          // ── (3) Transfer amounts via batch decrypt (per-entry error isolation) ──
-          const transfers = await getTransferHandles(delegator);
-          if (transfers.length === 0) continue;
-          const existing = await getExistingHandles(transfers);
-          const needed = transfers.filter((h) => !existing.has(h.toLowerCase()));
-          if (needed.length === 0) continue;
-
-          console.log(
-            `[decrypt-worker] ${delegator}: batch-decrypting ${needed.length} transfer handle(s)`,
-          );
-          for (const chunk of chunks(needed, HANDLES_PER_REQUEST)) {
-            const res = await tryBatchDecrypt(delegator, chunk as Hex[]);
-            for (const r of res) {
-              await upsertCleartext(r.handle, r.value);
-              totalDecrypted++;
+              // ── (3) Transfer amounts: claim + decrypt, CHUNKS IN PARALLEL ──
+              // Claiming per HANDLES_PER_REQUEST chunk (not the whole delegator at once) is what
+              // lets N parallel workers split ONE delegator's large backlog — each grabs
+              // different chunks. Running the chunks concurrently overlaps the round-trips for a
+              // single hot delegator too. The claim is the cross-worker authority (each handle
+              // won once, no double-decrypt); seenThisTick is an in-process pre-filter; handles
+              // claimed but not decrypted are released so another worker / next tick retries them.
+              const transfers = await getTransferHandles(delegator);
+              if (transfers.length === 0) return count;
+              let announced = false;
+              const chunkLimit = pLimit(CHUNK_CONCURRENCY);
+              const chunkCounts = await Promise.all(
+                chunks(transfers, HANDLES_PER_REQUEST).map((chunk) =>
+                  chunkLimit(async () => {
+                    const fresh: Hex[] = [];
+                    for (const h of chunk) {
+                      const k = h.toLowerCase();
+                      if (seenThisTick.has(k)) continue;
+                      seenThisTick.add(k);
+                      fresh.push(h);
+                    }
+                    const claimed = await claimHandles(fresh);
+                    if (claimed.length === 0) return 0;
+                    if (!announced) {
+                      console.log(`[decrypt-worker] ${delegator}: draining claimed transfer handles…`);
+                      announced = true;
+                    }
+                    const res = await tryBatchDecrypt(delegator, claimed);
+                    const ok = new Set(res.map((r) => r.handle.toLowerCase()));
+                    for (const r of res) await upsertCleartext(r.handle, r.value);
+                    await releaseHandles(claimed.filter((h) => !ok.has(h.toLowerCase())));
+                    return res.length;
+                  }),
+                ),
+              );
+              return count + chunkCounts.reduce((a, b) => a + b, 0);
+            } catch (err: any) {
+              console.error(
+                `[decrypt-worker] delegator=${delegator} loop error:`,
+                err?.message ?? err,
+              );
+              return count;
             }
-          }
-        } catch (err: any) {
-          console.error(
-            `[decrypt-worker] delegator=${delegator} loop error:`,
-            err?.message ?? err,
-          );
-        }
-      }
+          }),
+        ),
+      );
+      totalDecrypted += perDelegatorCounts.reduce((a, b) => a + b, 0);
 
       if (totalDecrypted > 0) {
         console.log(

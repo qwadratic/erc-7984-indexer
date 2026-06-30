@@ -9,7 +9,12 @@ import { TOKEN, INDEXER_ADDRESS } from "./config";
 // Balance handles are captured at HEAD by the decrypt worker (scripts/decrypt-worker.ts).
 // This makes backfill pure log fetching (fast, no archive RPC bottleneck).
 
-/** Upsert a holder in the balances table, marking stale */
+/**
+ * Record holder activity (indexer-owned). Advancing lastActivityBlock is the
+ * staleness signal the decrypt worker reads: any captured balance handle with
+ * handle_block < lastActivityBlock is stale and gets re-captured at HEAD.
+ * No balance handle is written here — that lives in app.balance_handle.
+ */
 async function touchHolder(
   db: any,
   address: `0x${string}`,
@@ -20,14 +25,10 @@ async function touchHolder(
     .values({
       address,
       token: TOKEN,
-      balanceHandle: null,
-      handleBlock: null,
       lastActivityBlock: blockNumber,
-      stale: true,
     })
     .onConflictDoUpdate({
       lastActivityBlock: blockNumber,
-      stale: true,
     });
 }
 
@@ -53,7 +54,7 @@ ponder.on("Underlying:Transfer", async ({ event, context }) => {
     cleartextAmount: event.args.value,
   });
 
-  // Mark the wrapping user as stale
+  // Record activity (worker re-captures balance handle at HEAD)
   await touchHolder(context.db, wrapper, event.block.number);
 });
 
@@ -100,7 +101,7 @@ ponder.on(
       });
     }
 
-    // Upsert holders with stale flag (zero RPC — no balance read)
+    // Record holder activity (zero RPC — no balance read; worker captures handle)
     if (from !== zeroAddress) {
       await touchHolder(context.db, from, event.block.number);
     }

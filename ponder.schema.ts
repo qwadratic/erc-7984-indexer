@@ -17,13 +17,16 @@ export const tokenEvent = onchainTable("token_event", (t) => ({
   toIdx:   index().on(t.token, t.toAddr,   t.blockNumber, t.logIndex),
 }));
 
+// Indexer-owned ONLY. The decrypt worker never writes here.
+// Captured balance handle + freshness live in app.balance_handle (side table,
+// worker-owned) — keeping worker writes off any Ponder-triggered table so they
+// can't pollute the reorg log (_reorg__ row trigger) or be clobbered on revert.
+// Staleness is DERIVED: a captured handle is current iff its handle_block >=
+// lastActivityBlock. See scripts/decrypt-worker.ts + src/cleartext-store.ts.
 export const balances = onchainTable("balances", (t) => ({
   address:           t.hex().notNull(),
   token:             t.hex().notNull(),
-  balanceHandle:     t.hex(),            // filled by decrypt worker at HEAD
-  handleBlock:       t.bigint(),         // block at which balanceHandle was captured
   lastActivityBlock: t.bigint().notNull(),
-  stale:             t.boolean().notNull(),
 }), (t) => ({
   pk: primaryKey({ columns: [t.address, t.token] }),
 }));
