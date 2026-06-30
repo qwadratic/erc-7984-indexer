@@ -63,7 +63,7 @@ Event handlers do NO `confidentialBalanceOf` / no `context.client.readContract`.
 - `ConfidentialTransfer` → transfer/wrap/unwrap row with amountHandle
 - `UnwrapFinalized` → fill unwrap cleartextAmount
 - `ACL.DelegatedForUserDecryption` / `ACL.RevokedDelegationForUserDecryption` → delegation_event
-- On every transfer/wrap/unwrap: upsert a `balances` row for each non-zero `from`/`to` with `lastActivityBlock = event.block.number`, `stale = true`
+- On every transfer/wrap/unwrap: upsert a `balances` row for each non-zero `from`/`to`, advancing `lastActivityBlock = event.block.number` (the signal the worker uses to re-capture a stale balance handle)
 
 This makes backfill pure log fetching — fast, no archive RPC bottleneck.
 
@@ -82,9 +82,11 @@ Combined with indexed-arg filters (`Underlying.Transfer to=TOKEN`, `ACL delegate
 
 **`delegation_event`** — Append-only log of ACL delegation events where `delegate == INDEXER_ADDRESS`. One row per grant/revoke. **No `active` column** — readability computed from latest event + expiration vs now. Event-sourced: can't drift.
 
-**`balances`** — `(address, token) PK → balanceHandle, handleBlock, lastActivityBlock, stale`. Handler marks stale on every event; worker refreshes handle at HEAD for delegated holders.
+**`balances`** — `(address, token) PK → lastActivityBlock`. Indexer-owned: the handler only advances `lastActivityBlock`. The captured balance handle lives in the worker-owned side table `app.balance_handle`, kept off any Ponder-triggered table so worker writes can't pollute the reorg log (Ponder snapshots every write to its tables via an `AFTER INSERT/UPDATE/DELETE` row trigger). Staleness is derived: a captured handle is current iff `handle_block ≥ lastActivityBlock`.
 
-**`app.cleartext`** — `cleartext(handle PK, value numeric, status text, decrypted_at timestamptz)`. The decrypt worker writes via `INSERT … ON CONFLICT DO UPDATE`. API reads via a separate `pg` pool (`src/cleartext-store.ts`).
+**`app.balance_handle`** — `(token, address) PK → handle, handle_block, captured_at`. Worker-owned HEAD capture of each delegated holder's current balance handle. Sibling to `app.cleartext`: outside Ponder's schema so the worker never writes a reorg-triggered table, and it survives a Ponder schema redeploy. Joined back in the balance API.
+
+**`app.cleartext`** — `cleartext(handle PK, value numeric, status text, decrypted_at timestamptz)`. The decrypt worker writes via `INSERT … ON CONFLICT DO UPDATE`. API reads via a separate `pg` pool (`src/cleartext-store.ts`). It is a **content-addressed index** — one row per *distinct* ciphertext, with `token_event.amount_handle` / `app.balance_handle.handle` as references into it. The references-÷-distinct ratio is the decrypt dedup win (the *automatic win*), exposed live at `GET /v1/economics` and connected to gas + token value in **`ECONOMICS.md`**.
 
 ## Decrypt Worker Design
 
@@ -94,19 +96,21 @@ The decryption pipeline is the hard part, not the indexing.
 
 One loop, per readable delegator each tick:
 
-**(1) Current balance** — if the holder's `balances` row is `stale` or missing a handle, read `confidentialBalanceOf(addr)` at HEAD (one RPC), write `balanceHandle` + `handleBlock` + `stale=false`. Decrypt the balance handle first — a successful decrypt doubles as the **propagation gate**. On `DelegationNotPropagatedError`, skip the delegator this tick (handles stay pending, retry next tick).
+**(1) Current balance** — if the worker has no captured handle for the holder, or its `handle_block` predates the holder's `lastActivityBlock`, read `confidentialBalanceOf(addr)` at HEAD (one RPC) and upsert `app.balance_handle` (`handle` + `handle_block`). Decrypt the balance handle first — a successful decrypt doubles as the **propagation gate**. On `DelegationNotPropagatedError`, skip the delegator this tick (handles stay pending, retry next tick).
 
 **(2) Transfer amounts** — if propagated, batch-decrypt the delegator's undecrypted transfer `amountHandle`s via `delegatedBatchDecryptValues` (per-entry error isolation: one bad/unpropagated handle doesn't sink the chunk).
 
 **Balance history**: NOT decrypted/reconstructed. Deferred.
 
-### Counterparty-dedup
+### Counterparty-dedup, generalized to a distinct-handle index gate
 
 Before decrypting any handle, skip it if it already exists in `app.cleartext`. A shared transfer-amount handle decrypted via one party is reused for the counterparty — never decrypt the same handle twice. Checked explicitly via `getExistingHandles` before every decrypt batch.
 
+The load-bearing generalization: **a handle is a content identifier — identical ciphertext ⇒ identical `bytes32`.** So the worker's unit of work is the *distinct unseen ciphertext*, not the handle count. Counterparty-dedup is just the two-party case. The worker drains a **distinct-handle frontier**: per tick it collapses (a) repeats already in `app.cleartext`, (b) duplicates within one delegator's list, and (c) the same handle shared across delegators in that tick — into one decrypt. This is the single change that makes the decrypt rate depend on how much *distinct* cleartext exists, not on how many handles the chain emits. See *Break-even* below for why that is the only defense that scales.
+
 ### Relay parallelism
 
-Relay concurrency is bounded by `delegatedBatchDecryptValues`' own `maxConcurrency` (= `DECRYPT_RELAY_CONCURRENCY`, default 10) — no external `pLimit`. The balance gate uses `delegatedDecryptValues` (single handle); transfer amounts use the batch variant.
+Relay concurrency is bounded by `delegatedBatchDecryptValues`' own `maxConcurrency` (= `DECRYPT_RELAY_CONCURRENCY`, default 10), so the worker manages no concurrency of its own. The balance gate uses `delegatedDecryptValues` (single handle); transfer amounts use the batch variant.
 
 `HANDLES_PER_REQUEST = 28` — the gateway caps a request at **2048 total encrypted bits** (proven: `Decryption.sol:151 MAX_DECRYPTION_REQUEST_BITS` in zama-ai/fhevm; mirrored client-side by relayer-sdk's `check2048EncryptedBits`). It's a *bit* budget, not a handle count: euint64 = 64 bits → 32 max; we use 28 (conservative, euint64-only). The batch method does not auto-chunk, so we chunk.
 
@@ -129,9 +133,26 @@ Secrets via `psst` CLI: `MNEMONIC` (shared anvil + seed), `SEPOLIA_RPC_URL` (Alc
 
 ### Least confident under load
 
-Premise: RPC with decent rate limits → fresh sync fast, resyncs cheap (Ponder cache + reindex strategies). ERC-20-style transfer-event indexing is the dominant, community-optimized path → assumed NOT the bottleneck. So the weakest link is decryption, deliberately made independent of indexing (it only needs handles + the identities they're bound to, treated as given). The throughput readout in the flow test (`tests/flow.e2e.ts`, delegation-spike → cleartext resolution) exists to prove exactly that boundary — what breaks first is relayer throughput / propagation under a simultaneous-delegation spike; the test measures handles/sec on the fresh per-run delta to prove it.
+Premise: RPC with decent rate limits → fresh sync fast, resyncs cheap (Ponder cache + reindex strategies). ERC-20-style transfer-event indexing is the dominant, community-optimized path → assumed NOT the bottleneck. So the weakest link is decryption, deliberately made independent of indexing (it only needs handles + the identities they're bound to, treated as given). The throughput readout in the flow test (`tests/flow.e2e.ts`, delegation-spike → cleartext resolution) exists to prove exactly that boundary — what breaks first is relayer throughput / propagation under a simultaneous-delegation spike; the test measures decryption bandwidth (bytes/sec) on the fresh per-run delta to prove it.
 
-**Measured so far (warm, n=12, cold start excluded):** the relayer round-trip is the fixed cost — ~2.4s/request whether it carries 1 or 3 handles — so batching amortizes (~2.9× at 3 handles; one request holds up to `HANDLES_PER_REQUEST=28`). The SDK does **no** implicit cross-call batching (verified in source), so that amortization is ours to drive. **Honest caveat:** every existing handle was decrypted before, so relayer-side caching can't be ruled out — true-cold latency, the batch-28 *saturation* curve, and concurrency scaling remain **hypotheses** pending a funded fresh-handle run.
+**Measured (cold, funded Sepolia run — 190 fresh handles, ~0.10 ETH @ ~1.4 gwei):** the relayer round-trip is a fixed ~2.4–3.7s regardless of batch size, so a bigger batch amortizes it almost linearly. Cold per-handle latency: **2449 ms (B=1) → 581 (4) → 309 (8) → 150 (16) → 131 ms (28)** — 18× from batching alone (1 euint64 = 8 bytes). A single batch-28 request = **7.6 handles/s ≈ 61 B/s**; eight parallel batch-8 requests top out at **13.7 handles/s ≈ 110 cleartext bytes/s (0.107 KB/s)** — the measured ceiling. Concurrency scales **sublinearly** (P=8 only ~1.8× a single request): the shared Sepolia relayer serializes. No 429 even at 64 concurrent cached requests, so its hard rate wall was never reached. This **revises the earlier warm projection (~0.9 KB/s) down ~8×.** Reproduce: `recordings/stress.ts PHASE=all`; raw rows in `recordings/stress-result.json`.
+
+### Break-even: how many transfers/sec before the worker can't keep up
+
+The worker falls permanently behind when cleartext **arrives faster than it decrypts**. Two rates decide it:
+
+- **Service rate S** — handles/sec the worker decrypts. **Measured cold: ~13.7 handles/s ≈ 110 bytes/s** ceiling (batch-28 × concurrency-8; a single batch-28 request is 7.6/s). See *Measured* above.
+- **Arrival rate** — `transfers/sec × K`, where K = decryptable handles per transfer.
+
+Break-even is just **`transfers/sec = S / K`**.
+
+**cWETH (K=1) edges it out — barely.** Each transfer mints one fresh handle for ~460k gas, so the token's own arrival is capped at **~10.9 transfers/sec** (60M Sepolia block gas ÷ 460k ÷ 12s). Measured worker S ≈ **13.7/sec** — only **1.26×** the chain cap. So a single cWETH token can't be made to outrun the worker (gas throttles the producer first), but the margin is thin; on the shared testnet real arrival sits well under the cap, and a dedicated relayer or higher concurrency widens it.
+
+**A structural token can.** `evm/src/ConfidentialBasketMock.sol` is the stressor: a K-slot position whose one `basketTransfer` fans out into K `ConfidentialTransfer` logs — 1 real new ciphertext (~460k gas) plus K-1 re-emits of a *shared* template handle, each just a LOG4 (the EVM event opcode with 4 indexed topics, ~1,875 gas). So K× the handles at ~1× the gas. Arrival climbs to `~10.9×K`/sec while gas stays flat, so break-even collapses to **`S/K`** — **K=64 → ~0.21 tx/s, K=256 → ~0.05 tx/s** (measured S). The chain clears that trivially, so a structural token drowns the worker almost immediately. Grow the structure, the worker drowns. It reuses the inherited event, so the existing indexer and ABI ingest the extra handles unchanged.
+
+**The fix is structural, not constant-factor.** Bigger batches and more concurrency only raise S — they leave the `1/K` cliff intact. But the K-1 template handles are all the *same* ciphertext, so they decrypt once. The distinct-handle gate in `scripts/decrypt-worker.ts` folds them out, making break-even **flat in K** (≈ S) instead of `S/K`. That removes K from the denominator. It belongs in the indexer because indexing is ours to scale; the relayer is not. (`recordings/bigstruct-boundary.ts` models the 1/K-vs-flat shape; warm-bounded, but the shape holds regardless of the constants.)
+
+**Does this apply to cWETH? The cliff is the basket's, not the wrapper's.** cWETH emits one fresh handle per transfer: `transferred = FHE.select(success, amount, 0)` (`ERC7984.sol:292`) is computed anew each time, so K=1 — no template, no cheap handle inflation. On cWETH the gate degrades to its honest floor, counterparty-dedup: an A→B transfer's amount handle is the same `bytes32` for both parties' queries, so when both delegate in a spike the gate collapses it to one decrypt (~2× ceiling, already mostly covered by the per-tick DB dedup). So on cWETH the change is correct, idempotent, and throughput-neutral; it only earns its keep when the indexer is pointed at a structurally-inflating token. The finding is real — it describes the instrument, and names what a token must look like (cheap per-transfer handle fan-out) before the worker can be drowned at all.
 
 ### Time sink
 

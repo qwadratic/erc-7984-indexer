@@ -10,6 +10,13 @@ these are explicitly *not* in scope, captured so the trade-offs stay visible.
   degrades to `pending_rights` (honest), never an error.
 
 ## Decrypt pipeline
+- **Distinct-handle index gate (LANDED).** Decrypt work scales with *distinct unseen
+  ciphertext*, not handle count — a per-tick frontier dedups within-list and
+  cross-delegator repeats, generalizing counterparty-dedup. This is what keeps the
+  boundary flat under the big-structure stressor (`ConfidentialBasketMock`, K handles/
+  transfer); see `recordings/bigstruct-boundary-report.md` and DECISIONS *Break-even*.
+  Next: a persistent handle→cleartext index (survives restarts) and a
+  structural-handle bloom/skip list so known-constant slots never enter a batch at all.
 - **70/30 weighted scheduler** — ~70% latest/current, ~30% historical per cycle so
   pagination stays fast under deep history. (Current cut: balance/current first,
   transfers newest-first, no explicit split.)
@@ -64,9 +71,10 @@ WIP branches (`feat/batcher-utility`, credential-batching) batch *permits*, not 
 ours to design — the "future build" the brief invites:
 - **DecryptScheduler**: one queue per delegator/credential; flush on **batch-full (≤28)** OR a
   **configurable SLA deadline** (max wait before a lone request is sent); dedupe shared
-  counterparty handles; bound in-flight per delegator via `maxConcurrency`. Amortizes the ~2.5s
-  round-trip across up to 28 handles → ~11 handles/sec/delegator serial, ×concurrency parallel.
-  Sketch in `recordings/sdk-batching-report.md` (c).
+  counterparty handles; bound in-flight per delegator via `maxConcurrency`. Amortizes the ~2.4s
+  round-trip across up to 28 handles → **measured cold ~7.6 handles/s/delegator at batch-28**,
+  rising to **~13.7/s at concurrency-8** (sublinear; shared Sepolia relayer serializes). See
+  `recordings/stress-result.json` + `recordings/sdk-batching-report.md` (c).
 - When `sdk-236` ships, honor `RelayerRequestFailedError.retryAfterMs` (back-pressure).
 - SDK gap: gateway handle-limit isn't exposed/auto-chunked — our `HANDLES_PER_REQUEST=28` is
   empirical; would break if the gateway limit changes.
