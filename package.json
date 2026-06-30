@@ -20,7 +20,6 @@
     "@openzeppelin/confidential-contracts": "0.4.0",
     "@zama-fhe/sdk": "3.3.0-alpha.3",
     "hono": "^4.12.27",
-    "p-limit": "^6.0.0",
     "pg": "^8.22.0",
     "ponder": "^0.16.6",
     "viem": "^2.53.1",

@@ -571,8 +571,14 @@ async function main() {
       `Delegations in blocks ${del1Block} and ${del2Block} (same=${sameBlock}, adjacent=${adjacent})`);
   }
 
-  // Record delegation spike time (for throughput measurement)
+  // Record delegation spike time + baseline decrypted count, so the bandwidth readout
+  // below measures THIS run's fresh per-run delta, not cumulative rows from old runs.
   const delegationSpikeTime = Date.now();
+  let baselineDecrypted = 0;
+  try {
+    const { rows } = await pool.query(`SELECT count(*) AS cnt FROM app.cleartext WHERE status = 'decrypted'`);
+    baselineDecrypted = Number(rows[0]?.cnt ?? 0);
+  } catch {}
 
   // ── Short-window revocation (a2 revokes 1–3 blocks later) ──
   console.log(`\n  Short-window revoke (a2):`);
@@ -694,32 +700,52 @@ async function main() {
     log("health-api", false, e.message);
   }
 
-  // ── Decrypt worker: cleartext resolution + throughput readout ──
-  console.log(`\n  Decrypt-worker resolution + throughput:`);
+  // ── Decrypt worker: cleartext resolution + bandwidth readout ──
+  console.log(`\n  Decrypt-worker resolution + bandwidth:`);
 
-  let resolvedCount = 0;
+  let finalDecrypted = baselineDecrypted;
   const decryptTimeout = IS_LOCAL ? 60_000 : 600_000; // 10 min on Sepolia (real relayer is slow)
   try {
-    const rows = await pollDb(
+    // Wait for the first fresh handle (past baseline)…
+    await pollDb(
       `SELECT count(*) AS cnt FROM app.cleartext WHERE status = 'decrypted'`,
-      [], (r) => Number(r[0]?.cnt) > 0, decryptTimeout,
+      [], (r) => Number(r[0]?.cnt) > baselineDecrypted, decryptTimeout,
     );
-    resolvedCount = Number(rows[0]?.cnt);
-    log("cleartext-resolved", resolvedCount > 0, `${resolvedCount} handle(s) decrypted by worker`);
+    // …then drain: keep reading until the count stops rising for 8s, so we time full
+    // resolution of this run's handles, not just first-handle latency.
+    let stableMs = 0;
+    while (stableMs < 8_000) {
+      await sleep(2_000);
+      const { rows } = await pool.query(`SELECT count(*) AS cnt FROM app.cleartext WHERE status = 'decrypted'`);
+      const cnt = Number(rows[0]?.cnt ?? 0);
+      if (cnt > finalDecrypted) { finalDecrypted = cnt; stableMs = 0; } else { stableMs += 2_000; }
+    }
+    const delta = finalDecrypted - baselineDecrypted;
+    log("cleartext-resolved", delta > 0, `${delta} fresh handle(s) decrypted this run (total ${finalDecrypted})`);
   } catch (e: any) {
     log("cleartext-resolved", false, e.message);
   }
 
-  // Throughput readout: measure from delegation spike to now
-  const decryptWallMs = Date.now() - delegationSpikeTime;
-  const decryptWallSec = decryptWallMs / 1000;
-  const handlesPerSec = decryptWallSec > 0 ? resolvedCount / decryptWallSec : 0;
+  // Bandwidth readout: fresh per-run delta over wall-time from the delegation spike.
+  // 1 euint64 handle = 8 cleartext bytes. This rate is END-TO-END (includes delegation
+  // propagation), so treat it as a LOWER bound on raw decrypt bandwidth — the isolated
+  // cold/saturation/concurrency curves live in recordings/stress.ts (PHASE A/B/C).
+  const BYTES_PER_HANDLE = 8;
+  const resolvedDelta = Math.max(0, finalDecrypted - baselineDecrypted);
+  const decryptWallSec = (Date.now() - delegationSpikeTime) / 1000;
+  const handlesPerSec = decryptWallSec > 0 ? resolvedDelta / decryptWallSec : 0;
+  const bytesPerSec = handlesPerSec * BYTES_PER_HANDLE;
+  // Break-even: at K handles/transfer (cWETH K=1), transfers/sec = handles/sec / K is the
+  // arrival rate that would outpace this worker and grow cleartext debt without bound.
+  const K = 1;
+  const breakEvenTps = handlesPerSec / K;
 
-  console.log(`\n  ${BOLD}── Decryption Throughput Readout ──${RESET}`);
-  console.log(`  Handles resolved:    ${resolvedCount}`);
-  console.log(`  Wall-time (spike→now): ${decryptWallSec.toFixed(1)}s`);
-  console.log(`  Throughput:          ${handlesPerSec.toFixed(4)} handles/sec`);
-  console.log(`  Transfer count:      ${transferTxHashes.length}`);
+  console.log(`\n  ${BOLD}── Decryption Bandwidth Readout ──${RESET}`);
+  console.log(`  Fresh handles resolved:    ${resolvedDelta}`);
+  console.log(`  Wall-time (spike→drained): ${decryptWallSec.toFixed(1)}s`);
+  console.log(`  Bandwidth:                 ${bytesPerSec.toFixed(2)} bytes/sec  (${handlesPerSec.toFixed(4)} handles/sec)`);
+  console.log(`  Break-even (cWETH K=1):    ~${breakEvenTps.toFixed(2)} transfers/sec before debt grows`);
+  console.log(`  Transfer count:            ${transferTxHashes.length}`);
 
   // ── Sepolia: check a3 pending_rights in DB ──
   if (!IS_LOCAL) {

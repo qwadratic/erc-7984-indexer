@@ -44,6 +44,7 @@ demo/
 demos/
 docs/
 recordings/
+graphify-out/
 
 # planning doc — kept local, not in repo
 PLAN.md

@@ -3,6 +3,7 @@ pragma solidity ^0.8.27;
 
 import {Script, console} from "forge-std/Script.sol";
 import {MockERC20} from "../src/MockERC20.sol";
+import {ConfidentialBasketMock} from "../src/ConfidentialBasketMock.sol";
 import {ERC7984ERC20WrapperMock} from "@openzeppelin/confidential-contracts/mocks/token/ERC7984ERC20WrapperMock.sol";
 import {IERC20} from "@openzeppelin/contracts/interfaces/IERC20.sol";
 
@@ -32,6 +33,14 @@ contract DeployLocal is Script {
         // 3. Mint underlying to deployer for test flows
         underlying.mint(deployer, 1000 ether);
         console.log("DEPLOYER:", deployer);
+
+        // 4. Big-structure boundary instrument: K-slot confidential token. Each
+        //    basketTransfer emits SLOTS handles (1 live + SLOTS-1 structural), the knob
+        //    that pushes the decrypt worker past its service rate. K via BASKET_SLOTS.
+        uint256 slots_ = vm.envOr("BASKET_SLOTS", uint256(64));
+        ConfidentialBasketMock basket = new ConfidentialBasketMock("Confidential Basket", "cBASK", slots_);
+        console.log("BASKET:", address(basket));
+        console.log("BASKET_SLOTS:", slots_);
 
         vm.stopBroadcast();
     }
