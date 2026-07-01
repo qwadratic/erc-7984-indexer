@@ -106,23 +106,53 @@ export async function getIndexedHead(): Promise<bigint | null> {
   }
 }
 
-// Decryption queue depth: distinct transfer-amount handles indexed but not yet decrypted.
-// This is the backlog the worker drains at the measured service rate (~13.7 handles/s). It
-// grows without bound exactly when on-chain arrival outruns that rate (see
-// recordings/queue-demo.ts) — a live signal of the failure mode.
-export async function getQueueDepth(): Promise<number> {
+// Split undecrypted transfer handles into two disjoint counts:
+//   decryptQueueSize     — handles the worker WILL decrypt (at least one party is currently
+//                          delegated to the indexer). This is the operator's real backlog
+//                          signal; growth here = worker slipping vs. arrival.
+//   nonDecryptableHandles— handles the indexer CANNOT decrypt (neither party has an active
+//                          delegation). They sit in token_event forever unless a party
+//                          delegates later. Counted for visibility; not a backlog signal.
+// "Active delegation" = latest delegation_event per (delegator, delegate=INDEXER, token)
+// is a `grant` whose expiration hasn't passed (matches src/delegations.ts:isReadable and
+// the worker's getDelegators). Both counts derived in ONE query.
+export async function getHandleCounts(
+  indexer: Hex,
+  token: Hex,
+): Promise<{ decryptQueueSize: number; nonDecryptableHandles: number }> {
   await _init;
   const schema = await ponderSchema();
   const ZERO = "0x" + "0".repeat(64);
   const { rows } = await pool.query(
-    `SELECT count(*)::int AS cnt FROM (
-       SELECT DISTINCT lower(amount_handle) AS h FROM "${schema}".token_event
-       WHERE kind = 'transfer' AND cleartext_amount IS NULL AND amount_handle <> $1
-     ) refs
-     WHERE h NOT IN (SELECT handle FROM app.cleartext WHERE status = 'decrypted')`,
-    [ZERO],
+    `WITH readable AS (
+       SELECT DISTINCT ON (delegator) delegator
+       FROM "${schema}".delegation_event
+       WHERE delegate = $2 AND token = $3
+       ORDER BY delegator, block_number DESC, log_index DESC
+     ), readable_grants AS (
+       SELECT r.delegator FROM readable r
+       JOIN LATERAL (
+         SELECT kind, expiration FROM "${schema}".delegation_event de
+         WHERE de.delegator = r.delegator AND de.delegate = $2 AND de.token = $3
+         ORDER BY de.block_number DESC, de.log_index DESC LIMIT 1
+       ) latest ON true
+       WHERE latest.kind = 'grant' AND latest.expiration::numeric > extract(epoch from now())
+     ), undecrypted AS (
+       SELECT DISTINCT lower(te.amount_handle) AS h,
+              bool_or(te.from_addr IN (SELECT delegator FROM readable_grants)
+                   OR te.to_addr   IN (SELECT delegator FROM readable_grants)) AS readable
+       FROM "${schema}".token_event te
+       WHERE te.kind = 'transfer' AND te.amount_handle <> $1
+         AND lower(te.amount_handle) NOT IN (SELECT handle FROM app.cleartext WHERE status = 'decrypted')
+       GROUP BY lower(te.amount_handle)
+     )
+     SELECT
+       count(*) FILTER (WHERE readable)     ::int AS q,
+       count(*) FILTER (WHERE NOT readable) ::int AS n
+     FROM undecrypted`,
+    [ZERO, indexer.toLowerCase(), token.toLowerCase()],
   );
-  return rows[0]?.cnt ?? 0;
+  return { decryptQueueSize: rows[0]?.q ?? 0, nonDecryptableHandles: rows[0]?.n ?? 0 };
 }
 
 // ── Handle-economics ledger (the "automatic win", made queryable) ──

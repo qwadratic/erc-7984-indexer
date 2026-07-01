@@ -6,9 +6,9 @@ import { replaceBigInts } from "ponder";
 import { db } from "ponder:api";
 import { tokenEvent, balances, delegationEvent } from "ponder:schema";
 import { eq, or, and, desc, lt } from "ponder";
-import { getCleartextBatch, getRecentDecryptCount, getHandleEconomics, getBalanceHandle, getIndexedHead, getQueueDepth } from "../cleartext-store";
+import { getCleartextBatch, getRecentDecryptCount, getHandleEconomics, getBalanceHandle, getIndexedHead, getHandleCounts } from "../cleartext-store";
 import { isReadable, readableDelegators } from "../delegations";
-import { TOKEN } from "../config";
+import { TOKEN, INDEXER_ADDRESS } from "../config";
 
 const hexAddress = z
   .string()
@@ -197,11 +197,16 @@ app.get(
 );
 
 // GET /v1/health
-// indexedBlock   = Ponder's true sync head (compare to chain HEAD to judge "caught up").
-// lastEventBlock = last block that produced a token event — only moves on token activity,
-//                  so it can sit well behind HEAD while fully synced (NOT sync lag).
-// pendingHandles = distinct undecrypted transfer handles = decryption queue depth.
-// decryptedLast15m = handles decrypted in the last 15 min (worker liveness).
+// indexedBlock          = Ponder's true sync head (compare to chain HEAD to judge "caught up").
+// lastEventBlock        = last block that produced a token event — only moves on token activity,
+//                         so it can sit well behind HEAD while fully synced (NOT sync lag).
+// decryptQueueSize      = distinct undecrypted transfer handles whose from/to is currently
+//                         delegated to the indexer — the worker's REAL backlog. Growth =
+//                         worker slipping vs arrival (the failure-mode signal).
+// nonDecryptableHandles = distinct undecrypted transfer handles where NEITHER party has an
+//                         active delegation — the indexer can't decrypt them (sit forever
+//                         unless a party delegates later). Visibility only, not a backlog signal.
+// decryptedLast15m      = handles decrypted in the last 15 min (worker liveness).
 app.get("/v1/health", async (c) => {
   const latest = await db
     .select()
@@ -212,10 +217,15 @@ app.get("/v1/health", async (c) => {
 
   let decryptedLast15m = 0;
   let indexedBlock: bigint | null = null;
-  let pendingHandles = 0;
+  let decryptQueueSize = 0;
+  let nonDecryptableHandles = 0;
   try { decryptedLast15m = await getRecentDecryptCount(15); } catch {}
   try { indexedBlock = await getIndexedHead(); } catch {}
-  try { pendingHandles = await getQueueDepth(); } catch {}
+  try {
+    const counts = await getHandleCounts(INDEXER_ADDRESS, TOKEN);
+    decryptQueueSize = counts.decryptQueueSize;
+    nonDecryptableHandles = counts.nonDecryptableHandles;
+  } catch {}
 
   return c.json(
     replaceBigInts(
@@ -223,7 +233,8 @@ app.get("/v1/health", async (c) => {
         status: "ok",
         indexedBlock,                                   // true sync head (≈ chain HEAD when caught up)
         lastEventBlock: latest[0]?.blockNumber ?? null, // last block with a token event (not sync lag)
-        pendingHandles,                                 // decryption queue depth
+        decryptQueueSize,                               // worker's real backlog (readable-only)
+        nonDecryptableHandles,                          // undecryptable (no active delegation on either side)
         decryptedLast15m,
         readableUsers: delegators.length,
       },
