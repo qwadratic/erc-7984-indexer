@@ -20,9 +20,9 @@
  * A shared transfer-amount handle decrypted via one party is reused for the counterparty.
  */
 
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { hostname } from "node:os";
+import { loadEnvLocal } from "../src/load-env";
+import { readableDelegatorsFromRows } from "../src/delegations";
 
 // ── Parallel-friendly: NO single-instance lock. ──
 // Multiple workers may run concurrently and split the backlog via per-handle DB row-claims
@@ -36,19 +36,7 @@ process.on("uncaughtException", (err) => {
 });
 
 // Load .env.local manually (ponder auto-loads it, but we're standalone)
-const envPath = resolve(import.meta.dirname ?? ".", "..", ".env.local");
-try {
-  const envContent = readFileSync(envPath, "utf-8");
-  for (const line of envContent.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim();
-    if (!process.env[key]) process.env[key] = val;
-  }
-} catch {}
+loadEnvLocal();
 
 import pg from "pg";
 import {
@@ -176,9 +164,11 @@ const BALANCE_ABI = [
 
 // ── SQL helpers ──
 const INDEXER_ADDRESS = account.address.toLowerCase();
-const MAX_UINT64 = "18446744073709551615";
 
 async function getDelegators(): Promise<Address[]> {
+  // DISTINCT ON already collapses to the latest event per delegator; the shared
+  // readability rule (src/delegations.ts) then keeps only active grants — same rule
+  // the API applies over the drizzle rows.
   const { rows } = await pool.query(
     `SELECT DISTINCT ON (delegator) delegator, kind, expiration
      FROM "${PONDER_SCHEMA}".delegation_event
@@ -186,16 +176,7 @@ async function getDelegators(): Promise<Address[]> {
      ORDER BY delegator, block_number DESC, log_index DESC`,
     [INDEXER_ADDRESS, TOKEN],
   );
-  const now = BigInt(Math.floor(Date.now() / 1000));
-  const result: Address[] = [];
-  for (const row of rows) {
-    if (row.kind !== "grant") continue;
-    const exp = BigInt(row.expiration);
-    if (exp.toString() === MAX_UINT64 || exp > now + 60n) {
-      result.push(row.delegator as Address);
-    }
-  }
-  return result;
+  return readableDelegatorsFromRows(rows);
 }
 
 /**
@@ -585,4 +566,7 @@ async function runLoop() {
   }
 }
 
-runLoop();
+runLoop().catch((err) => {
+  console.error("[decrypt-worker] fatal:", err);
+  process.exit(1);
+});

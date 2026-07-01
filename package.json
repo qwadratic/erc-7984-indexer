@@ -9,7 +9,7 @@
     "start": "ponder start",
     "db": "ponder db",
     "codegen": "ponder codegen",
-    "lint": "eslint .",
+    "lint": "eslint . --ext .ts,.tsx",
     "typecheck": "tsc",
     "decrypt": "tsx scripts/decrypt-worker.ts",
     "test": "CHAIN=local tsx tests/flow.e2e.ts",

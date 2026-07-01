@@ -32,25 +32,13 @@
  *   MNEMONIC — (Sepolia only) HD wallet mnemonic
  */
 
-import { readFileSync } from "node:fs";
 import { execSync, exec } from "node:child_process";
-import { resolve } from "node:path";
 import pg from "pg";
+import { loadEnvLocal } from "../src/load-env";
+import { MAX_UINT64 } from "../src/delegations";
 
 // ── Load .env.local ──
-const envPath = resolve(import.meta.dirname ?? ".", "..", ".env.local");
-try {
-  const envContent = readFileSync(envPath, "utf-8");
-  for (const line of envContent.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim();
-    if (!process.env[key]) process.env[key] = val;
-  }
-} catch {}
+loadEnvLocal();
 
 const IS_LOCAL = (process.env.CHAIN ?? "").toLowerCase() === "local";
 if (!IS_LOCAL && (process.env.CHAIN ?? "").toLowerCase() !== "sepolia") {
@@ -127,7 +115,7 @@ const RED = "\x1b[31m";
 const YELLOW = "\x1b[33m";
 const BOLD = "\x1b[1m";
 const RESET = "\x1b[0m";
-const MAX_EXPIRATION = "18446744073709551615";
+const MAX_EXPIRATION = MAX_UINT64.toString();
 
 let passed = 0;
 let failed = 0;

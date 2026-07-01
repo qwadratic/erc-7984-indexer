@@ -7,8 +7,47 @@ import { db } from "ponder:api";
 import { tokenEvent, balances, delegationEvent } from "ponder:schema";
 import { eq, or, and, desc, lt } from "ponder";
 import { getCleartextBatch, getRecentDecryptCount, getBalanceHandle, getIndexedHead, getHandleCounts } from "../cleartext-store";
-import { isReadable, readableDelegators } from "../delegations";
+import { isActiveGrant, readableDelegatorsFromRows } from "../delegations";
 import { TOKEN, INDEXER_ADDRESS } from "../config";
+
+// Ponder-db wrappers over delegation_event. The readability *rule* lives in
+// src/delegations.ts (pure, shared with the decrypt worker); these just fetch the
+// rows via the drizzle query builder and hand them to that rule.
+async function isReadable(
+  database: typeof db,
+  address: `0x${string}`,
+): Promise<boolean> {
+  const rows = await database
+    .select()
+    .from(delegationEvent)
+    .where(
+      and(
+        eq(delegationEvent.delegator, address.toLowerCase() as `0x${string}`),
+        eq(delegationEvent.delegate, INDEXER_ADDRESS),
+        eq(delegationEvent.token, TOKEN),
+      ),
+    )
+    .orderBy(desc(delegationEvent.blockNumber), desc(delegationEvent.logIndex))
+    .limit(1);
+  const row = rows[0];
+  return row ? isActiveGrant(row.kind, BigInt(row.expiration)) : false;
+}
+
+async function readableDelegators(
+  database: typeof db,
+): Promise<`0x${string}`[]> {
+  const rows = await database
+    .select()
+    .from(delegationEvent)
+    .where(
+      and(
+        eq(delegationEvent.delegate, INDEXER_ADDRESS),
+        eq(delegationEvent.token, TOKEN),
+      ),
+    )
+    .orderBy(desc(delegationEvent.blockNumber), desc(delegationEvent.logIndex));
+  return readableDelegatorsFromRows(rows);
+}
 
 const hexAddress = z
   .string()

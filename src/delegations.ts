@@ -1,64 +1,58 @@
-import { eq, and, desc } from "ponder";
-import { delegationEvent } from "ponder:schema";
-import { INDEXER_ADDRESS, TOKEN } from "./config";
 import type { Address } from "viem";
 
-type Db = {
-  select(): any;
-};
+/**
+ * Delegation readability rules — pure and dependency-free ON PURPOSE.
+ *
+ * Both readers of `delegation_event` share these rules but reach the rows through
+ * different layers: the Ponder API via the drizzle query builder (`ponder:schema`),
+ * the standalone decrypt worker via raw `pg`. This module imports neither, so the
+ * worker — which runs outside Ponder and can't resolve `ponder:schema` — can import
+ * it too. The ponder-side query wrappers live in `src/api/index.ts`; the worker's
+ * SQL lives in `scripts/decrypt-worker.ts`. Keep the *rule* here, once.
+ */
 
-const MAX_UINT64 = 18446744073709551615n;
+/** Max uint64 — the "forever" delegation expiry (never expires). */
+export const MAX_UINT64 = 18446744073709551615n;
 
-export async function isReadable(db: Db, address: Address): Promise<boolean> {
-  const rows = await db
-    .select()
-    .from(delegationEvent)
-    .where(
-      and(
-        eq(delegationEvent.delegator, address.toLowerCase() as `0x${string}`),
-        eq(delegationEvent.delegate, INDEXER_ADDRESS),
-        eq(delegationEvent.token, TOKEN),
-      ),
-    )
-    .orderBy(desc(delegationEvent.blockNumber), desc(delegationEvent.logIndex))
-    .limit(1);
-
-  if (!rows[0]) return false;
-  const row = rows[0];
-  if (row.kind !== "grant") return false;
-  const exp = BigInt(row.expiration);
-  if (exp === MAX_UINT64) return true;
-  // Valid if expiration > now + 60s
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  return exp > nowSec + 60n;
+/**
+ * Whether a delegator's LATEST delegation event grants active decryption rights:
+ * a grant (not a revoke) that either never expires (`MAX_UINT64`) or expires more
+ * than 60s out — a small margin so we don't act on an about-to-expire grant.
+ */
+export function isActiveGrant(
+  kind: string,
+  expiration: bigint,
+  nowSec: bigint = BigInt(Math.floor(Date.now() / 1000)),
+): boolean {
+  if (kind !== "grant") return false;
+  if (expiration === MAX_UINT64) return true;
+  return expiration > nowSec + 60n;
 }
 
-export async function readableDelegators(db: Db): Promise<Address[]> {
-  // Get all distinct delegators with grants to our indexer for our token
-  const rows = await db
-    .select()
-    .from(delegationEvent)
-    .where(
-      and(
-        eq(delegationEvent.delegate, INDEXER_ADDRESS),
-        eq(delegationEvent.token, TOKEN),
-      ),
-    )
-    .orderBy(desc(delegationEvent.blockNumber), desc(delegationEvent.logIndex));
+type DelegationRow = {
+  delegator: string;
+  kind: string;
+  expiration: bigint | string | number;
+};
 
-  // Group by delegator, take latest event per delegator
-  const latest = new Map<string, (typeof rows)[0]>();
+/**
+ * Reduce delegation-event rows — ordered newest-first (block desc, logIndex desc) —
+ * to the delegator addresses whose latest event is an active grant. Rows already
+ * deduped to one-per-delegator (e.g. SQL `DISTINCT ON`) work too: the grouping is
+ * then a no-op.
+ */
+export function readableDelegatorsFromRows(
+  rows: DelegationRow[],
+  nowSec: bigint = BigInt(Math.floor(Date.now() / 1000)),
+): Address[] {
+  const latest = new Map<string, DelegationRow>();
   for (const row of rows) {
     const d = row.delegator.toLowerCase();
     if (!latest.has(d)) latest.set(d, row);
   }
-
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
   const result: Address[] = [];
   for (const [addr, row] of latest) {
-    if (row.kind !== "grant") continue;
-    const exp = BigInt(row.expiration);
-    if (exp === MAX_UINT64 || exp > nowSec + 60n) {
+    if (isActiveGrant(row.kind, BigInt(row.expiration), nowSec)) {
       result.push(addr as Address);
     }
   }
