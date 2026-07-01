@@ -4,7 +4,7 @@ import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import { replaceBigInts } from "ponder";
 import { db } from "ponder:api";
-import { tokenEvent, balances, delegationEvent } from "ponder:schema";
+import { tokenEvent, delegationEvent } from "ponder:schema";
 import { eq, or, and, desc, lt } from "ponder";
 import { getCleartextBatch, getRecentDecryptCount, getBalanceHandle, getIndexedHead, getHandleCounts } from "../cleartext-store";
 import { isActiveGrant, readableDelegatorsFromRows } from "../delegations";
@@ -82,32 +82,18 @@ app.get(
   zValidator("param", addressParam),
   async (c) => {
     const { address } = c.req.valid("param");
-    const bal = await db
+
+    // Holder existence is derived from token_event (no `balances` table): an
+    // address with no from/to row has never held the ciphertext.
+    const hasEvents = await db
       .select()
-      .from(balances)
+      .from(tokenEvent)
       .where(
-        and(eq(balances.address, address), eq(balances.token, TOKEN)),
+        or(eq(tokenEvent.toAddr, address), eq(tokenEvent.fromAddr, address)),
       )
       .limit(1);
-
-    if (!bal[0]) {
-      const hasEvents = await db
-        .select()
-        .from(tokenEvent)
-        .where(
-          or(eq(tokenEvent.toAddr, address), eq(tokenEvent.fromAddr, address)),
-        )
-        .limit(1);
-      if (!hasEvents[0])
-        return c.json({ address, handle: null, balance: null, status: "no_ciphertext" });
-      const readable = await isReadable(db, address);
-      return c.json({
-        address,
-        handle: null,
-        balance: null,
-        status: readable ? "pending" : "pending_rights",
-      });
-    }
+    if (!hasEvents[0])
+      return c.json({ address, handle: null, balance: null, status: "no_ciphertext" });
 
     // Balance handle is worker-owned, in app.balance_handle (not Ponder's table).
     const bh = await getBalanceHandle(TOKEN, address);

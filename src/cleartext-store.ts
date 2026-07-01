@@ -38,8 +38,9 @@ const _init = pool.query(`
 `);
 
 // Captured balance handle for (token, address). handleBlock is the HEAD block at
-// which the worker captured it; compare against balances.lastActivityBlock to
-// know if it's stale. Returns null when the worker hasn't captured one yet.
+// which the worker captured it; compare against the holder's latest token_event
+// activity block to know if it's stale. Returns null when the worker hasn't
+// captured one yet.
 export async function getBalanceHandle(
   token: Hex,
   address: Hex,

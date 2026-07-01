@@ -1,5 +1,5 @@
 import { ponder } from "ponder:registry";
-import { tokenEvent, balances, delegationEvent } from "ponder:schema";
+import { tokenEvent, delegationEvent } from "ponder:schema";
 import { zeroAddress } from "viem";
 import { eq, and, desc } from "ponder";
 import { TOKEN, INDEXER_ADDRESS } from "./config";
@@ -8,29 +8,10 @@ import { TOKEN, INDEXER_ADDRESS } from "./config";
 // All handlers index logs only — no confidentialBalanceOf, no context.client.readContract.
 // Balance handles are captured at HEAD by the decrypt worker (scripts/decrypt-worker.ts).
 // This makes backfill pure log fetching (fast, no archive RPC bottleneck).
-
-/**
- * Record holder activity (indexer-owned). Advancing lastActivityBlock is the
- * staleness signal the decrypt worker reads: any captured balance handle with
- * handle_block < lastActivityBlock is stale and gets re-captured at HEAD.
- * No balance handle is written here — that lives in app.balance_handle.
- */
-async function touchHolder(
-  db: any,
-  address: `0x${string}`,
-  blockNumber: bigint,
-) {
-  await db
-    .insert(balances)
-    .values({
-      address,
-      token: TOKEN,
-      lastActivityBlock: blockNumber,
-    })
-    .onConflictDoUpdate({
-      lastActivityBlock: blockNumber,
-    });
-}
+//
+// No `balances` table is maintained: a holder's last-activity block is derived
+// on demand from token_event (the worker's staleness signal for re-capturing a
+// balance handle). Handlers write only token_event + delegation_event.
 
 // Underlying ERC-20 Transfer — capture wrap amounts (public)
 // Fires BEFORE ConfidentialTransfer (underlying pull → then mint).
@@ -53,9 +34,6 @@ ponder.on("Underlying:Transfer", async ({ event, context }) => {
       "0x0000000000000000000000000000000000000000000000000000000000000000" as `0x${string}`,
     cleartextAmount: event.args.value,
   });
-
-  // Record activity (worker re-captures balance handle at HEAD)
-  await touchHolder(context.db, wrapper, event.block.number);
 });
 
 // ConfidentialTransfer — covers transfer, wrap (from=0x0), unwrap (to=0x0)
@@ -99,14 +77,6 @@ ponder.on(
         amountHandle: event.args.amount,
         cleartextAmount: null,
       });
-    }
-
-    // Record holder activity (zero RPC — no balance read; worker captures handle)
-    if (from !== zeroAddress) {
-      await touchHolder(context.db, from, event.block.number);
-    }
-    if (to !== zeroAddress) {
-      await touchHolder(context.db, to, event.block.number);
     }
   },
 );

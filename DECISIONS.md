@@ -37,9 +37,8 @@ The one unusual demand on wallet integration: **keep the delegation active.** A 
 - `ConfidentialTransfer` → transfer/wrap/unwrap row with `amountHandle`
 - `UnwrapFinalized` → fill unwrap `cleartextAmount`
 - `ACL.Delegated` / `RevokedForUserDecryption` → `delegation_event`
-- every transfer/wrap/unwrap advances each non-zero holder's `balances.lastActivityBlock` (the signal the worker uses to re-capture a stale balance handle)
 
-So backfill is pure log-fetch — no archive-RPC bottleneck.
+So backfill is pure log-fetch — no archive-RPC bottleneck. There's no `balances` table: a holder's last-activity block (the signal for re-capturing a stale balance handle) is derived on demand as `max(block_number)` over that address's `token_event` rows.
 
 **Per-contract start blocks** (`ponder.config.ts`): `ERC7984ERC20Wrapper` ← `START_BLOCK`, `Underlying` ← `UNDERLYING_START_BLOCK`, `ACL` ← `ACL_START_BLOCK` (recent — network-wide busy; we only want our delegations). With indexed-arg filters (`Underlying.Transfer to=TOKEN`, `ACL delegate=INDEXER_ADDRESS`), log volume stays minimal.
 
@@ -49,9 +48,9 @@ So backfill is pure log-fetch — no archive-RPC bottleneck.
 
 **`delegation_event`** — append-only log of ACL events where `delegate == INDEXER_ADDRESS`, one row per grant/revoke. **No `active` column** — readability is computed from the latest event + expiration, so it can't drift.
 
-**`balances`** — `(address, token) PK → lastActivityBlock`, indexer-owned; the handler only advances `lastActivityBlock`. The captured balance handle lives in the worker-owned `app.balance_handle`, kept off any Ponder-triggered table so worker writes can't pollute the reorg log. Staleness is derived: a handle is current iff `handle_block ≥ lastActivityBlock`.
+*(No `balances` table.* A holder's last-activity block is derived from `token_event` — one onchain source of truth, no separate materialization, no per-transfer write. The only per-holder state is the worker-captured handle below.)
 
-**`app.balance_handle`** — `(token, address) PK → handle, handle_block, captured_at`. Worker-owned HEAD capture, sibling to `app.cleartext`, outside Ponder's schema (survives a schema redeploy). Joined back in the balance API.
+**`app.balance_handle`** — `(token, address) PK → handle, handle_block, captured_at`. The **one** balance-state table: the worker's HEAD capture of each delegated holder's current balance ciphertext (from a `confidentialBalanceOf` RPC — not present in any event, so it can't be derived). Sibling to `app.cleartext`, outside Ponder's schema so worker writes never hit a reorg-triggered table, and it survives a schema redeploy. Staleness is derived: the handle is current iff `handle_block ≥ max(block_number)` over the holder's `token_event` rows. Joined back in the balance API; the balance handle also serves the worker's propagation gate.
 
 **`app.cleartext`** — `handle PK, value, status, decrypted_at, claimed_by, claimed_at`. A **content-addressed index**: one row per *distinct* ciphertext, referenced by `token_event.amount_handle` / `app.balance_handle.handle`. The worker writes via `INSERT … ON CONFLICT DO UPDATE`; the API reads via a separate `pg` pool (`src/cleartext-store.ts`). The claim columns are the parallel-worker split authority (below).
 
@@ -59,7 +58,7 @@ So backfill is pure log-fetch — no archive-RPC bottleneck.
 
 The decryption pipeline is the hard part. One loop, per readable delegator each tick:
 
-**(1) Balance gate.** If the worker has no captured handle, or its `handle_block` predates the holder's `lastActivityBlock`, read `confidentialBalanceOf(addr)` at HEAD (one RPC) and upsert `app.balance_handle`. Decrypt that balance handle first — a success doubles as the **propagation gate**; on `DelegationNotPropagatedError`, skip the delegator this tick.
+**(1) Balance gate.** If the worker has no captured handle, or its `handle_block` predates the holder's latest `token_event` activity block, read `confidentialBalanceOf(addr)` at HEAD (one RPC) and upsert `app.balance_handle`. Decrypt that balance handle first — a success doubles as the **propagation gate**; on `DelegationNotPropagatedError`, skip the delegator this tick.
 
 **(2) Transfer amounts.** If propagated, batch-decrypt the delegator's undecrypted `amountHandle`s via `delegatedBatchDecryptValues` (per-entry error isolation: one bad handle doesn't sink the chunk). Balance *history* is not reconstructed — deferred.
 

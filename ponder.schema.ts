@@ -1,4 +1,4 @@
-import { onchainTable, index, primaryKey } from "ponder";
+import { onchainTable, index } from "ponder";
 
 export const tokenEvent = onchainTable("token_event", (t) => ({
   id:              t.text().primaryKey(),
@@ -17,19 +17,14 @@ export const tokenEvent = onchainTable("token_event", (t) => ({
   toIdx:   index().on(t.token, t.toAddr,   t.blockNumber, t.logIndex),
 }));
 
-// Indexer-owned ONLY. The decrypt worker never writes here.
-// Captured balance handle + freshness live in app.balance_handle (side table,
-// worker-owned) — keeping worker writes off any Ponder-triggered table so they
-// can't pollute the reorg log (_reorg__ row trigger) or be clobbered on revert.
-// Staleness is DERIVED: a captured handle is current iff its handle_block >=
-// lastActivityBlock. See scripts/decrypt-worker.ts + src/cleartext-store.ts.
-export const balances = onchainTable("balances", (t) => ({
-  address:           t.hex().notNull(),
-  token:             t.hex().notNull(),
-  lastActivityBlock: t.bigint().notNull(),
-}), (t) => ({
-  pk: primaryKey({ columns: [t.address, t.token] }),
-}));
+// No dedicated `balances` table. A holder's last-activity block is DERIVED on
+// demand as max(block_number) over that address's token_event rows (indexed on
+// both from_addr and to_addr) — token_event is the single onchain source of
+// truth. The worker-captured HEAD balance handle (not present in any event)
+// lives in the side table app.balance_handle, off any Ponder-triggered table so
+// worker writes can't pollute the reorg log. Staleness is DERIVED: a captured
+// handle is current iff its handle_block >= that max activity block.
+// See scripts/decrypt-worker.ts + src/cleartext-store.ts.
 
 export const delegationEvent = onchainTable("delegation_event", (t) => ({
   id:          t.text().primaryKey(),

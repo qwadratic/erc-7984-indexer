@@ -180,17 +180,21 @@ async function getDelegators(): Promise<Address[]> {
 }
 
 /**
- * Balance state = indexer activity (READ-ONLY from Ponder's balances) joined with
- * the worker's own captured handle (app.balance_handle). A pure SELECT on Ponder's
- * table does NOT fire its reorg trigger, so reading is safe; we just never write it.
- * Staleness is derived: recapture iff no handle yet OR handle_block < lastActivityBlock.
+ * Balance state = the holder's last-activity block (DERIVED from Ponder's
+ * token_event) joined with the worker's own captured handle (app.balance_handle).
+ * Pure SELECTs on Ponder's table don't fire its reorg trigger, so reading is safe;
+ * we never write it. lastActivityBlock = max(block_number) over the address's
+ * from/to rows (both indexed). Staleness is derived: recapture iff no handle yet
+ * OR handle_block < lastActivityBlock.
  */
 async function getBalanceState(
   addr: Address,
 ): Promise<{ handle: Hex | null; handleBlock: bigint | null; lastActivityBlock: bigint | null }> {
   const { rows: act } = await pool.query(
-    `SELECT last_activity_block FROM "${PONDER_SCHEMA}".balances
-     WHERE address = $1 AND token = $2`,
+    `SELECT greatest(
+       (SELECT max(block_number) FROM "${PONDER_SCHEMA}".token_event WHERE token = $2 AND from_addr = $1),
+       (SELECT max(block_number) FROM "${PONDER_SCHEMA}".token_event WHERE token = $2 AND to_addr = $1)
+     ) AS last_activity_block`,
     [addr.toLowerCase(), TOKEN],
   );
   const lastActivityBlock =
