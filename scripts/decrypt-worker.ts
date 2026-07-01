@@ -357,13 +357,17 @@ const RELAY_CONCURRENCY = Number(process.env.DECRYPT_RELAY_CONCURRENCY ?? 10);
 const ZERO_HANDLE =
   "0x0000000000000000000000000000000000000000000000000000000000000000";
 
-// Per-tick parallelism. The relayer rewards concurrent batches (measured ~2.3× at P=8), and a
-// serial per-delegator loop pays one round-trip per delegator just for the balance gate.
-// DELEGATOR_CONCURRENCY overlaps the balance-gate round-trips across delegators; CHUNK_CONCURRENCY
-// overlaps one delegator's transfer batches. The DB row-claim stays the authority on who decrypts
-// each handle, so this added concurrency never double-decrypts — it only overlaps the waiting.
-const DELEGATOR_CONCURRENCY = Number(process.env.DECRYPT_DELEGATOR_CONCURRENCY ?? 4);
-const CHUNK_CONCURRENCY = Number(process.env.DECRYPT_CHUNK_CONCURRENCY ?? 4);
+// Per-tick parallelism. Measured live on Sepolia (recordings/load-test-report.md):
+//   DELEGATOR_CONCURRENCY=5 CC=1 → 6.97 h/s sustained on a 490-handle backlog (best).
+//   CHUNK_CONCURRENCY>1 → SDK per-item fallback path triggers under sustained load,
+//     produces item-failures and is 2.4× slower than serial chunks (worst config).
+// Winning shape: parallelize ACROSS delegators (their balance gates overlap), keep chunks
+// WITHIN a delegator serial so no single delegator saturates the relayer alone.
+// The 17.4 h/s from stress.ts phase B was a burst peak on 64 cached handles — not a
+// sustainable steady-state ceiling. The DB row-claim stays the authority on who decrypts
+// each handle, so this concurrency never double-decrypts — it only overlaps the waiting.
+const DELEGATOR_CONCURRENCY = Number(process.env.DECRYPT_DELEGATOR_CONCURRENCY ?? 5);
+const CHUNK_CONCURRENCY = Number(process.env.DECRYPT_CHUNK_CONCURRENCY ?? 1);
 
 function pLimit(n: number) {
   let active = 0;
