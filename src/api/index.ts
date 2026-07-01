@@ -6,7 +6,7 @@ import { replaceBigInts } from "ponder";
 import { db } from "ponder:api";
 import { tokenEvent, balances, delegationEvent } from "ponder:schema";
 import { eq, or, and, desc, lt } from "ponder";
-import { getCleartextBatch, getRecentDecryptCount, getHandleEconomics, getBalanceHandle, getIndexedHead, getHandleCounts } from "../cleartext-store";
+import { getCleartextBatch, getRecentDecryptCount, getBalanceHandle, getIndexedHead, getHandleCounts } from "../cleartext-store";
 import { isReadable, readableDelegators } from "../delegations";
 import { TOKEN, INDEXER_ADDRESS } from "../config";
 
@@ -241,40 +241,6 @@ app.get("/v1/health", async (c) => {
       String,
     ),
   );
-});
-
-// GET /v1/economics
-// The "automatic win", observable. dedupMultiplier = handle references ÷ distinct
-// ciphertext = how much decrypt work the distinct-handle index gate folds away.
-// ~2 = gas-bound entropy token (cWETH); ≫2 = index-bound structural token. See ECONOMICS.md.
-const GAS_PER_TRANSFER = 460_000; // runbook.md, real Sepolia receipt
-const GWEI = 6.7; // runbook.md observed; ideally live cast gas-price
-const PER_HANDLE_S = 2.45 / (28 * 10); // round-trip / (batch-28 × conc-10), warm
-app.get("/v1/economics", async (c) => {
-  let econ;
-  try {
-    econ = await getHandleEconomics();
-  } catch {
-    return c.json({ error: "economics unavailable (tables not ready)" }, 503);
-  }
-  const decryptSecondsSaved =
-    (econ.naiveDecryptAttempts - econ.distinctHandles) * PER_HANDLE_S;
-  const gasGeneratedEth = econ.distinctHandles * GAS_PER_TRANSFER * GWEI * 1e-9;
-  // dedupMultiplier ~2 = entropy token (cWETH); >3 means structural ciphertext reuse, so
-  // the index has gone from a 2x nicety to load-bearing. Threshold documented in ECONOMICS.md.
-  const regime =
-    econ.dedupMultiplier > 3 ? "index-bound (structural reuse)" : "gas-bound (entropy)";
-  return c.json({
-    naiveDecryptAttempts: econ.naiveDecryptAttempts, // what a no-index worker would attempt (from/to ×2 + balances)
-    distinctHandles: econ.distinctHandles, // real decrypt work
-    decryptedHandles: econ.decryptedHandles,
-    dedupMultiplier: Number(econ.dedupMultiplier.toFixed(3)),
-    cleartextBytes: econ.distinctHandles * 8,
-    decryptSecondsSaved: Number(decryptSecondsSaved.toFixed(2)),
-    gasGeneratedEthAt6_7Gwei: Number(gasGeneratedEth.toFixed(4)), // STALE price — runbook.md @6.7gwei, not live
-    regime,
-    notes: "warm decrypt constants; gas est = distinctHandles × 460k @6.7gwei (runbook.md), not live gas price",
-  });
 });
 
 // GET /v1/delegations

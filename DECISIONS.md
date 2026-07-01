@@ -86,7 +86,7 @@ Combined with indexed-arg filters (`Underlying.Transfer to=TOKEN`, `ACL delegate
 
 **`app.balance_handle`** — `(token, address) PK → handle, handle_block, captured_at`. Worker-owned HEAD capture of each delegated holder's current balance handle. Sibling to `app.cleartext`: outside Ponder's schema so the worker never writes a reorg-triggered table, and it survives a Ponder schema redeploy. Joined back in the balance API.
 
-**`app.cleartext`** — `cleartext(handle PK, value numeric, status text, decrypted_at timestamptz)`. The decrypt worker writes via `INSERT … ON CONFLICT DO UPDATE`. API reads via a separate `pg` pool (`src/cleartext-store.ts`). It is a **content-addressed index** — one row per *distinct* ciphertext, with `token_event.amount_handle` / `app.balance_handle.handle` as references into it. The references-÷-distinct ratio is the decrypt dedup win (the *automatic win*), exposed live at `GET /v1/economics` and connected to gas + token value in **`ECONOMICS.md`**.
+**`app.cleartext`** — `cleartext(handle PK, value numeric, status text, decrypted_at timestamptz, claimed_by text, claimed_at timestamptz)`. The decrypt worker writes via `INSERT … ON CONFLICT DO UPDATE`. API reads via a separate `pg` pool (`src/cleartext-store.ts`). It is a **content-addressed index** — one row per *distinct* ciphertext, with `token_event.amount_handle` / `app.balance_handle.handle` as references into it. The claim columns are the parallel-worker split authority (see § Decrypt Worker Design).
 
 ## Decrypt Worker Design
 

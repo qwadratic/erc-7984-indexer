@@ -84,7 +84,6 @@ Base URL: `http://localhost:42069` (default). Live instance: `https://erc7984-in
 | Method | Path | Returns |
 |--------|------|---------|
 | `GET` | `/v1/delegations` | `{ items: [...] }` — recent delegation events |
-| `GET` | `/v1/economics` | `{ naiveDecryptAttempts, distinctHandles, dedupMultiplier, regime, ... }` — the decrypt dedup win, live. `regime: gas-bound` is normal (cWETH); `index-bound` means a structural token where the index is load-bearing. See [`ECONOMICS.md`](ECONOMICS.md). |
 | `GET` | `/ready` | Ponder built-in: 200 caught up, 503 syncing |
 
 **Status values:** `decrypted` · `pending` (delegated, decrypt in progress) · `pending_rights` (no delegation) · `no_ciphertext` (never wrapped)

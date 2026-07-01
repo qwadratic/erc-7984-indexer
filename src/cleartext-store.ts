@@ -155,61 +155,16 @@ export async function getHandleCounts(
   return { decryptQueueSize: rows[0]?.q ?? 0, nonDecryptableHandles: rows[0]?.n ?? 0 };
 }
 
-// ── Handle-economics ledger (the "automatic win", made queryable) ──
-// app.cleartext is a content-addressed index: one row per DISTINCT ciphertext. Every
-// transfer/balance handle on-chain is a *reference* INTO it. The dedup multiplier
-// (references ÷ distinct handles) is the win the distinct-handle index gate buys:
-//   - ~2 for an entropy token (cWETH): from/to counterparty de-double, irreducible n² entropy
-//   - ≫2 for a structural/templated token: shared ciphertext collapses to one decrypt
-// See ECONOMICS.md. Read-only aggregate; opt-in endpoint, not on the hot path.
-let _ECON_SCHEMA: string | null = null;
+// Cache Ponder's schema name (discovered once from information_schema). Used by
+// getIndexedHead and getHandleCounts, both of which read Ponder's tables.
+let _PONDER_SCHEMA: string | null = null;
 async function ponderSchema(): Promise<string> {
-  if (_ECON_SCHEMA) return _ECON_SCHEMA;
+  if (_PONDER_SCHEMA) return _PONDER_SCHEMA;
   const { rows } = await pool.query(
     `SELECT table_schema FROM information_schema.tables WHERE table_name = 'token_event' LIMIT 1`,
   );
-  _ECON_SCHEMA = rows[0]?.table_schema ?? "public";
-  return _ECON_SCHEMA ?? "public";
-}
-
-export interface HandleEconomics {
-  naiveDecryptAttempts: number; // from/to double-counted transfer refs + balance refs = what a no-index worker would attempt
-  distinctHandles: number; // rows in the index = real decrypt work
-  decryptedHandles: number; // distinct handles actually decrypted so far
-  dedupMultiplier: number; // naiveDecryptAttempts / distinctHandles = the automatic win
-}
-
-export async function getHandleEconomics(): Promise<HandleEconomics> {
-  await _init;
-  const schema = await ponderSchema();
-  const ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
-  // refs = every handle the chain emitted (each transfer amount is queryable by 2 parties
-  // → counted twice, matching the from/to decrypt attempts the index collapses).
-  const { rows } = await pool.query(
-    `WITH refs AS (
-       SELECT amount_handle AS handle FROM "${schema}".token_event
-         WHERE kind = 'transfer' AND amount_handle <> $1
-       UNION ALL
-       SELECT amount_handle FROM "${schema}".token_event
-         WHERE kind = 'transfer' AND amount_handle <> $1
-       UNION ALL
-       SELECT handle FROM app.balance_handle WHERE handle IS NOT NULL
-     )
-     SELECT
-       (SELECT count(*) FROM refs)::int                         AS ref_handles,
-       (SELECT count(DISTINCT handle) FROM refs)::int            AS distinct_handles,
-       (SELECT count(*) FROM app.cleartext WHERE status='decrypted')::int AS decrypted_handles`,
-    [ZERO],
-  );
-  const r = rows[0] ?? {};
-  const naiveDecryptAttempts = r.ref_handles ?? 0;
-  const distinctHandles = r.distinct_handles ?? 0;
-  return {
-    naiveDecryptAttempts,
-    distinctHandles,
-    decryptedHandles: r.decrypted_handles ?? 0,
-    dedupMultiplier: distinctHandles > 0 ? naiveDecryptAttempts / distinctHandles : 0,
-  };
+  _PONDER_SCHEMA = rows[0]?.table_schema ?? "public";
+  return _PONDER_SCHEMA ?? "public";
 }
 
 
